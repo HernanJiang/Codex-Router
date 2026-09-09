@@ -163,17 +163,130 @@ pub fn restart_codex_desktop() -> anyhow::Result<CodexRestartOutcome> {
 
 #[cfg(not(windows))]
 pub fn restart_codex_desktop() -> anyhow::Result<CodexRestartOutcome> {
-    Ok(CodexRestartOutcome::NotRunning)
+    let targets = chatgpt_processes()?;
+    if targets.is_empty() {
+        return Ok(CodexRestartOutcome::NotRunning);
+    }
+    for pid in &targets {
+        signal_process(*pid, libc::SIGTERM);
+    }
+    if !wait_processes_gone(&targets, GRACEFUL_CLOSE_TIMEOUT) {
+        for pid in &targets {
+            signal_process(*pid, libc::SIGKILL);
+        }
+        if !wait_processes_gone(&targets, RELAUNCH_TIMEOUT) {
+            anyhow::bail!("Codex / ChatGPT desktop did not exit within 10 seconds")
+        }
+    }
+    // Relaunch whatever bundle the running processes came from; fall back to
+    // the conventional install locations resolved by name.
+    let app = targets
+        .iter()
+        .filter_map(|pid| process_command(*pid).ok())
+        .find_map(|command| app_bundle_from_command(&command))
+        .unwrap_or_else(|| "ChatGPT".to_owned());
+    std::process::Command::new("open")
+        .args(["-a", &app])
+        .stdin(std::process::Stdio::null())
+        .spawn()
+        .context("could not relaunch Codex / ChatGPT desktop")?;
+    let deadline = std::time::Instant::now() + RELAUNCH_TIMEOUT;
+    while std::time::Instant::now() < deadline {
+        if !chatgpt_processes().unwrap_or_default().is_empty() {
+            return Ok(CodexRestartOutcome::Restarted);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    anyhow::bail!("Codex / ChatGPT desktop did not start within 10 seconds")
+}
+
+#[cfg(not(windows))]
+const GRACEFUL_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+#[cfg(not(windows))]
+const RELAUNCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// PIDs whose executable name is exactly `ChatGPT` (the
+/// `/Applications/ChatGPT.app` process). Never matches prefix siblings.
+#[cfg(not(windows))]
+fn chatgpt_processes() -> anyhow::Result<Vec<u32>> {
+    let output = std::process::Command::new("pgrep")
+        .args(["-x", "ChatGPT"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .context("could not enumerate processes")?;
+    // pgrep exits 1 when nothing matches: not an error here.
+    if !output.status.success() {
+        return Ok(Vec::new());
+    }
+    Ok(parse_pgrep_output(&String::from_utf8_lossy(&output.stdout)))
+}
+
+#[cfg(not(windows))]
+fn parse_pgrep_output(text: &str) -> Vec<u32> {
+    text.split_whitespace()
+        .filter_map(|token| token.parse::<u32>().ok())
+        .filter(|pid| *pid > 0)
+        .collect()
+}
+
+#[cfg(not(windows))]
+fn process_command(process_id: u32) -> anyhow::Result<String> {
+    let output = std::process::Command::new("ps")
+        .args(["-p", &process_id.to_string(), "-o", "command="])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .context("could not query the process table")?;
+    if !output.status.success() {
+        anyhow::bail!("process {process_id} is not running");
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+/// `/Applications/ChatGPT.app/Contents/MacOS/ChatGPT ...` -> the `.app` bundle.
+#[cfg(not(windows))]
+fn app_bundle_from_command(command: &str) -> Option<String> {
+    let executable = command.split_whitespace().next()?;
+    let marker = ".app/";
+    let end = executable.find(marker)? + ".app".len();
+    let bundle = &executable[..end];
+    if bundle.is_empty() {
+        return None;
+    }
+    Some(bundle.to_owned())
+}
+
+#[cfg(not(windows))]
+fn signal_process(process_id: u32, signal: libc::c_int) {
+    unsafe {
+        libc::kill(process_id as libc::pid_t, signal);
+    }
+}
+
+#[cfg(not(windows))]
+fn wait_processes_gone(processes: &[u32], timeout: std::time::Duration) -> bool {
+    let started = std::time::Instant::now();
+    while started.elapsed() < timeout {
+        if processes
+            .iter()
+            .all(|pid| unsafe { libc::kill(*pid as libc::pid_t, 0) } != 0)
+        {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    processes
+        .iter()
+        .all(|pid| unsafe { libc::kill(*pid as libc::pid_t, 0) } != 0)
+}
+
+#[cfg(not(windows))]
+pub fn codex_desktop_running() -> bool {
+    chatgpt_processes().is_ok_and(|processes| !processes.is_empty())
 }
 
 #[cfg(windows)]
 pub fn codex_desktop_running() -> bool {
     codex_desktop_processes().is_ok_and(|processes| !processes.is_empty())
-}
-
-#[cfg(not(windows))]
-pub fn codex_desktop_running() -> bool {
-    false
 }
 
 #[cfg(windows)]
@@ -449,6 +562,44 @@ fn utf16_c_string(value: &[u16]) -> String {
         .position(|character| *character == 0)
         .unwrap_or(value.len());
     String::from_utf16_lossy(&value[..end])
+}
+
+#[cfg(all(test, not(windows)))]
+mod unix_tests {
+    use super::*;
+
+    #[test]
+    fn pgrep_output_parses_pids_and_ignores_junk() {
+        assert_eq!(parse_pgrep_output("1477\n"), vec![1477]);
+        assert_eq!(parse_pgrep_output(""), Vec::<u32>::new());
+        assert_eq!(parse_pgrep_output("abc\n0\n42\n"), vec![42]);
+    }
+
+    #[test]
+    fn app_bundle_resolves_from_process_command() {
+        assert_eq!(
+            app_bundle_from_command(
+                "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT --some-flag"
+            )
+            .as_deref(),
+            Some("/Applications/ChatGPT.app")
+        );
+        assert_eq!(
+            app_bundle_from_command("/Users/x/Applications/ChatGPT.app/Contents/MacOS/ChatGPT")
+                .as_deref(),
+            Some("/Users/x/Applications/ChatGPT.app")
+        );
+        assert!(app_bundle_from_command("/usr/bin/sleep 60").is_none());
+        assert!(app_bundle_from_command("").is_none());
+    }
+
+    #[test]
+    fn desktop_running_probe_does_not_fail() {
+        // Value depends on the machine (ChatGPT may or may not run here);
+        // this pins the probe wiring only.
+        let _ = codex_desktop_running();
+        let _ = chatgpt_processes();
+    }
 }
 
 #[cfg(all(test, windows))]

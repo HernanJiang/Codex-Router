@@ -222,13 +222,217 @@ mod win {
 /// macOS first-version: autostart is not yet implemented (launchd plist comes
 /// later). These are safe no-ops that keep the API surface identical.
 #[cfg(not(windows))]
-pub fn set_enabled(_router_root: &std::path::Path, _enabled: bool) -> anyhow::Result<()> {
-    Ok(())
+mod mac {
+    use anyhow::Context;
+    use std::path::{Path, PathBuf};
+
+    const LAUNCHD_LABEL: &str = "com.github.hernanjiang.codexrouter";
+    const PLIST_FILE_NAME: &str = "com.github.hernanjiang.codexrouter.plist";
+
+    fn agents_dir() -> PathBuf {
+        // Test hook: point the plist at a scratch directory and skip the
+        // launchctl service calls.
+        if let Some(dir) = std::env::var_os("CODEX_ROUTER_LAUNCHD_DIR") {
+            return PathBuf::from(dir);
+        }
+        dirs::home_dir()
+            .map(|home| home.join("Library").join("LaunchAgents"))
+            .unwrap_or_else(std::env::temp_dir)
+    }
+
+    fn plist_path() -> PathBuf {
+        agents_dir().join(PLIST_FILE_NAME)
+    }
+
+    fn manage_service() -> bool {
+        std::env::var_os("CODEX_ROUTER_LAUNCHD_DIR").is_none()
+    }
+
+    fn xml_escape(value: &str) -> String {
+        value
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;")
+    }
+
+    fn plist_document(executable: &Path) -> String {
+        let executable = xml_escape(&executable.to_string_lossy());
+        format!(
+            concat!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n",
+                "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" ",
+                "\"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n",
+                "<plist version=\"1.0\">\n",
+                "<dict>\n",
+                "\t<key>Label</key>\n",
+                "\t<string>{label}</string>\n",
+                "\t<key>ProgramArguments</key>\n",
+                "\t<array>\n",
+                "\t\t<string>{executable}</string>\n",
+                "\t\t<string>--background</string>\n",
+                "\t</array>\n",
+                "\t<key>RunAtLoad</key>\n",
+                "\t<true/>\n",
+                "</dict>\n",
+                "</plist>\n"
+            ),
+            label = LAUNCHD_LABEL,
+            executable = executable,
+        )
+    }
+
+    fn gui_domain() -> String {
+        let uid = unsafe { libc::getuid() };
+        format!("gui/{uid}")
+    }
+
+    fn launchctl(args: &[&str]) {
+        // Best effort: the plist in ~/Library/LaunchAgents is what persists
+        // across logins. A failing bootstrap/bootout is logged, never fatal.
+        let status = std::process::Command::new("launchctl").args(args).status();
+        match status {
+            Ok(status) if status.success() => {}
+            other => eprintln!("[autostart] launchctl {args:?} -> {other:?}"),
+        }
+    }
+
+    pub fn set_enabled(router_root: &Path, enabled: bool) -> anyhow::Result<()> {
+        use codex_router_lib::backend::config_compiler as cli_compiler;
+
+        let executable = router_root.join(cli_compiler::gui_executable_file_name());
+        if enabled && !executable.is_file() {
+            anyhow::bail!(
+                "{} is missing from the selected installation root",
+                cli_compiler::gui_executable_file_name()
+            );
+        }
+        let plist = plist_path();
+        if enabled {
+            if let Some(parent) = plist.parent() {
+                std::fs::create_dir_all(parent).context("could not create LaunchAgents directory")?;
+            }
+            // Atomic write so loginwindow never reads a half-written plist.
+            let temporary = plist.with_extension("plist.tmp");
+            std::fs::write(&temporary, plist_document(&executable))
+                .context("could not write the launchd plist")?;
+            std::fs::rename(&temporary, &plist).context("could not install the launchd plist")?;
+            if manage_service() {
+                launchctl(&["bootstrap", &gui_domain(), &plist.to_string_lossy()]);
+            }
+        } else {
+            if manage_service() {
+                launchctl(&["bootout", &format!("{}/{}", gui_domain(), LAUNCHD_LABEL)]);
+            }
+            match std::fs::remove_file(&plist) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error).context("could not remove the launchd plist"),
+            }
+        }
+        Ok(())
+    }
+
+    pub fn is_registered() -> bool {
+        plist_path().is_file()
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::sync::{Mutex, OnceLock};
+
+        fn test_env(dir: &Path) -> Vec<(String, String)> {
+            vec![(
+                "CODEX_ROUTER_LAUNCHD_DIR".to_owned(),
+                dir.to_string_lossy().into_owned(),
+            )]
+        }
+
+        fn with_env(dir: &Path, run: impl FnOnce()) {
+            // Process-wide env is shared by parallel tests; serialize.
+            static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+            let _guard = LOCK
+                .get_or_init(|| Mutex::new(()))
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let saved = std::env::var_os("CODEX_ROUTER_LAUNCHD_DIR");
+            for (key, value) in test_env(dir) {
+                std::env::set_var(&key, &value);
+            }
+            run();
+            match saved {
+                Some(value) => std::env::set_var("CODEX_ROUTER_LAUNCHD_DIR", value),
+                None => std::env::remove_var("CODEX_ROUTER_LAUNCHD_DIR"),
+            }
+        }
+
+        fn scratch(label: &str) -> PathBuf {
+            let dir = std::env::temp_dir().join(format!(
+                "codex-router-launchd-{label}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            dir
+        }
+
+        #[test]
+        fn enable_writes_a_valid_plist_and_disable_removes_it() {
+            let scope = scratch("cycle");
+            let root = scope.join("CodexRouter");
+            std::fs::create_dir_all(root.join("app")).unwrap();
+            #[cfg(windows)]
+            let gui = "Codex-Router.exe";
+            #[cfg(not(windows))]
+            let gui = "Codex-Router";
+            std::fs::write(root.join(gui), b"stub").unwrap();
+            with_env(&scope, || {
+                assert!(!is_registered());
+                set_enabled(&root, true).unwrap();
+                assert!(is_registered());
+                let plist = std::fs::read_to_string(plist_path()).unwrap();
+                assert!(plist.contains(LAUNCHD_LABEL));
+                assert!(plist.contains("--background"));
+                assert!(plist.contains(&xml_escape(&root.join(gui).to_string_lossy())));
+                // Idempotent: enabling twice keeps a single valid plist.
+                set_enabled(&root, true).unwrap();
+                assert!(is_registered());
+                set_enabled(&root, false).unwrap();
+                assert!(!is_registered());
+                // Disabling twice is a no-op success.
+                set_enabled(&root, false).unwrap();
+            });
+            let _ = std::fs::remove_dir_all(scope);
+        }
+
+        #[test]
+        fn enable_refuses_a_root_without_gui_binary() {
+            let scope = scratch("missing");
+            let root = scope.join("Empty");
+            std::fs::create_dir_all(&root).unwrap();
+            with_env(&scope, || {
+                assert!(set_enabled(&root, true).is_err());
+                assert!(!is_registered());
+            });
+            let _ = std::fs::remove_dir_all(scope);
+        }
+    }
 }
 
+/// macOS autostart through a user LaunchAgents plist (see `mac` above).
+#[cfg(not(windows))]
+pub fn set_enabled(router_root: &std::path::Path, enabled: bool) -> anyhow::Result<()> {
+    mac::set_enabled(router_root, enabled)
+}
+
+/// macOS autostart is registered while the LaunchAgents plist is installed.
 #[cfg(not(windows))]
 pub fn is_registered() -> bool {
-    false
+    mac::is_registered()
 }
 
 #[cfg(windows)]

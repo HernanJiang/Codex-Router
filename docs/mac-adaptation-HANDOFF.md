@@ -27,6 +27,38 @@
 - 新增 3 个 Mac 单测（exists/reap、terminate sleep、listener 自举），GUI bin 全量 503 pass 连绿 3 次；`cargo test` 全绿（lib 202 + bin 503 + host 8）。
 - 黑盒复验：host 直拉真 darwin CLI，`/health` 200、`/v1/models` 带 key 200/不带 401、`plugins.enabled=false` 落盘生效。
 - **端到端打通（2026-09-09 真机）**：用户经 GUI 向导配好 mimo-v2.5 并一键部署后，`GET /v1/models` 返回 `mimo-v2.5`，`POST /v1/chat/completions` 透过本机 18080 → host → darwin CLIProxy → 上游拿到真实回复（MiMo-v2.5 自我介绍）。Mac 核心链路闭环。
+
+---
+
+## 本轮完成（2026-09-09 第三轮，辅助功能打通）
+
+- `autostart.rs` 393 行 diff 已 review：纯搬运进 `mod win` + Mac no-op，机械 diff 只有 fmt/空行，Windows 语义一致 ✅。
+- 单实例：`flock` 文件锁（`~/Library/Application Support/Codex-Router/gui-single-instance.lock`），`main()` 全平台启用，重复启动弹 rfd 提示后退出；单测覆盖 等待锁释放语义。
+- 自启动：launchd plist（`com.github.hernanjiang.codexrouter`，`--background` + RunAtLoad）+ bootstrap/bootout；`plutil` OK + dummy 程序上下线真机验证 ✅。
+- 系统代理：`scutil --proxy` 解析填共享 `internet` 槽，来源标 `macos`；本机 Clash（127.0.0.1:7897）真实识别 ✅。
+- 重启 Codex 桌面：`pgrep -x ChatGPT` → SIGTERM(5s) → SIGKILL → `open -a` bundle（从被杀进程 argv[0] 反推）；`/Applications/ChatGPT.app` 存在 ✅；**杀进程本体未真机实测**（当时用户在用）。
+- 孤儿清理：host 支持 SIGTERM 优雅停机（顺手杀 CLI），真机验证双亡+端口释放 ✅。
+- Gemini 缺口收敛：两处 OAuth picker + `start_provider_oauth` 在 Mac 对 gemini 置灰/拒绝（API Key 渠道不受影响）。
+- 验证：`cargo test` 全绿（lib 202 + bin 512 + host 8），clippy 0 unused，全量 2 次确认；改动未提交。
+- 待用户真机确认：托盘图标出现与否、GUI 重启后 flock 生效（旧 GUI 进程无锁）、设置页自启动开关、ChatGPT 重启按钮。
+
+---
+
+## 本轮完成（2026-09-09 第四轮，存盘加密）
+
+- Mac OAuth 快照文件保护：Windows DPAPI 的等价实现——AES-256-GCM（新增 `aes-gcm` 依赖），DEK（32 字节随机）存钥匙串 `FileProtectionKey`，blob 格式 `CR1` 魔数 + 12 字节随机 nonce + 密文tag；无魔数的旧明文文件透传兼容。
+- 单测：roundtrip、nonce 随机性、密文无明文残留、篡改必报认证错、截断报错；DEK 落钥匙串真机确认 ✅。
+- `cargo test` 全绿（lib 202 + bin 513 + host 8），clippy 0 unused；测试包二进制已更新；改动未提交。
+
+---
+
+## 本轮完成（2026-09-09 第五轮，Gemini 插件反转 + 系统层 junk 修复）
+
+- 用户质疑“geminicli 有 Mac 版”是对的，我之前结论下早了。重验：独立仓库 `router-for-me/cpa-plugin-gemini-cli` v1.0.5 **有官方 `darwin_arm64` 构建**（`gemini-cli.dylib` 9.4MB，包哈希与上游 checksums.txt 对上）。
+- 真机 live 证据：`pluginhost: plugin loaded/registered`，`/v0/management/plugins` 报 `registered/effective_enabled/supports_oauth=true`，`gemini-cli-auth-url` 200（无插件时 404；其余 5 家 OAuth 路由 darwin 原生 200，不需插件）。
+- 落地：`GEMINI_PLUGIN_SHA256_MACOS` + 包哈希进常量与 NOTICES；`gemini_plugin_relative_path`/`required_runtime_relative_paths`/`validate`/`apply_platform_runtime_policy`/`start_cli` 全部按 `windows|macos vs 其他` 重切；三处 UI 置灰已撤销；测试包已含 `app/plugins/darwin/arm64/gemini-cli.dylib`。
+- 附带修复：部署时往 `app/` 下写出 `C:\ProgramData/...` 字面目录（`codex_system_config_path` 回退路径在 Unix 是相对路径）。Mac 无系统层概念：public 写/删/probe/退出 persist 全部 no-op（`_to/_from` 保留给单测），回归单测 + 3 个 Windows-only 语义测试已门住；测试包内 junk 已删。
+- 教训：外部事实必须黑盒验到终态（这次是“路由真返回 200”），不能靠“包里没看到”下结论。
 - 教训：凡是“看起来 Ok 但实际没干活”的降级（no-op 返回 Ok/None）都是定时炸弹，Mac 适配里一律按“未实现”处理，要么真实现，要么 loud bail。
 
 ---

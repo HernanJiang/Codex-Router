@@ -1018,7 +1018,15 @@ pub(crate) fn probe_codex_binding_state_with_key(
     let base_url = codex_public_base_url(cfg);
     let user_layer_bound =
         !existing.trim().is_empty() && super::codex_config_uses_router(&existing, &base_url);
+    // Off Windows there is no system layer; never consult the meaningless
+    // fallback path (on Unix `C:\ProgramData` is a relative junk name).
+    #[cfg(windows)]
     let system_content = std::fs::read_to_string(system_config_path).unwrap_or_default();
+    #[cfg(not(windows))]
+    let system_content = {
+        let _ = system_config_path;
+        String::new()
+    };
     let system_layer_bound = system_content
         .lines()
         .any(|line| line.trim() == SYSTEM_BINDING_MARKER)
@@ -1277,7 +1285,8 @@ pub fn write_codex_system_binding(
     display_openai_provider: bool,
     max_retries: u32,
 ) -> anyhow::Result<()> {
-    write_codex_system_binding_to(
+    #[cfg(windows)]
+    return write_codex_system_binding_to(
         &codex_system_config_path(),
         catalog_path,
         local_api_key,
@@ -1285,7 +1294,21 @@ pub fn write_codex_system_binding(
         require_openai_auth,
         display_openai_provider,
         max_retries,
-    )
+    );
+    // No system config layer exists off Windows (Codex reads only the user
+    // layer there); writing would create `C:\...`-named junk files.
+    #[cfg(not(windows))]
+    {
+        let _ = (
+            catalog_path,
+            local_api_key,
+            base_url,
+            require_openai_auth,
+            display_openai_provider,
+            max_retries,
+        );
+        Ok(())
+    }
 }
 
 /// Remove the Router-owned keys from the system-layer Codex config, deleting
@@ -1364,7 +1387,11 @@ pub(crate) fn remove_codex_system_binding_from(path: &Path) -> anyhow::Result<bo
 }
 
 pub fn remove_codex_system_binding() -> anyhow::Result<bool> {
-    remove_codex_system_binding_from(&codex_system_config_path())
+    #[cfg(windows)]
+    return remove_codex_system_binding_from(&codex_system_config_path());
+    // No system layer off Windows; nothing to remove.
+    #[cfg(not(windows))]
+    return Ok(false);
 }
 
 /// Keep historical Codex conversations loadable after the Router binding is
@@ -1458,6 +1485,24 @@ fn preserve_router_provider_for_history_with_key(
 mod tests {
     use super::*;
     use crate::config::{ModelConfig, OAuthFallback};
+
+    #[cfg(not(windows))]
+    #[test]
+    fn system_binding_writes_nothing_off_windows() {
+        // Regression: the `%ProgramData%` fallback path is relative junk on
+        // Unix (`<cwd>/C:\ProgramData/...`). The public wrappers must no-op.
+        assert!(write_codex_system_binding(
+            Path::new("catalog.json"),
+            "local-key",
+            "http://127.0.0.1:18080",
+            false,
+            false,
+            3,
+        )
+        .is_ok());
+        assert!(!remove_codex_system_binding().unwrap());
+        assert!(!Path::new(r"C:\ProgramData").exists());
+    }
 
     #[test]
     fn oauth_profile_keeps_v1_5_2_login_and_custom_catalog_contract() {
@@ -2318,6 +2363,8 @@ sandbox = "unelevated"
         (router_root, codex_home, cfg)
     }
 
+    // Windows-only: asserts the %ProgramData% system layer is honored.
+    #[cfg(windows)]
     #[test]
     fn binding_probe_does_not_rewrite_invalid_user_model() {
         let tmp = std::env::temp_dir().join(format!(
@@ -2447,6 +2494,8 @@ sandbox = "unelevated"
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
+    // Windows-only: asserts the %ProgramData% system layer is honored.
+    #[cfg(windows)]
     #[test]
     fn self_check_does_not_rewrite_lost_user_layer_when_system_still_routes() {
         let tmp = std::env::temp_dir().join(format!(

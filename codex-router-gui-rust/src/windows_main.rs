@@ -1945,6 +1945,12 @@ fn persist_legal_system_binding_for_exit(
     config: &RouterConfig,
     system_config_path: &Path,
 ) -> anyhow::Result<()> {
+    // No system config layer exists off Windows; nothing to persist.
+    #[cfg(not(windows))]
+    {
+        let _ = (router_root, config, system_config_path);
+        return Ok(());
+    }
     // Closing Router used to delete %ProgramData%\OpenAI\Codex\config.toml.
     // Desktop then falls through to ChatGPT OAuth (`requires_openai_auth=true`)
     // the next time it strips the user file, which is the login loop. Keep a
@@ -9157,6 +9163,17 @@ fn process_name_running(names: &[&str]) -> bool {
     }
 }
 
+#[cfg(not(windows))]
+fn show_already_running_message() {
+    let _ = rfd::MessageDialog::new()
+        .set_title("Codex-Router")
+        .set_description(
+            "Codex-Router 已经开启，请勿重复开启。\n\nCodex-Router is already running. Do not start another instance.",
+        )
+        .set_level(rfd::MessageLevel::Info)
+        .show();
+}
+
 #[cfg(windows)]
 fn show_already_running_message() {
     use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONINFORMATION, MB_OK};
@@ -9177,6 +9194,47 @@ fn show_already_running_message() {
             MB_OK | MB_ICONINFORMATION,
         );
     }
+}
+
+#[cfg(not(windows))]
+struct SingleInstanceGuard {
+    _file: std::fs::File,
+}
+
+#[cfg(not(windows))]
+fn acquire_single_instance() -> Option<SingleInstanceGuard> {
+    match lock_single_instance_file() {
+        Ok(Some(file)) => Some(SingleInstanceGuard { _file: file }),
+        _ => {
+            show_already_running_message();
+            None
+        }
+    }
+}
+
+/// Non-blocking exclusive lock without any UI: Ok(Some) = acquired,
+/// Ok(None) = held elsewhere, Err = lock file unusable. Separated so tests
+/// can exercise the semantics without popping a dialog.
+#[cfg(not(windows))]
+fn lock_single_instance_file() -> anyhow::Result<Option<std::fs::File>> {
+    use std::os::unix::io::AsRawFd;
+
+    // One GUI per user login, independent of the portable root (mirrors the
+    // Windows global mutex). flock is kernel-released on process death, so a
+    // crash can never leave a stale lock behind.
+    let dir = dirs::data_local_dir()
+        .map(|dir| dir.join("Codex-Router"))
+        .context("could not locate the local application data directory")?;
+    std::fs::create_dir_all(&dir)?;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(dir.join("gui-single-instance.lock"))?;
+    let locked = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
+    if !locked {
+        return Ok(None);
+    }
+    Ok(Some(file))
 }
 
 #[cfg(windows)]
@@ -9804,7 +9862,6 @@ fn main() -> eframe::Result<()> {
     updater::startup_housekeeping();
 
     let ui_audit = UiAuditOptions::from_args();
-    #[cfg(windows)]
     let _single_instance = if ui_audit.is_none() {
         let Some(guard) = acquire_single_instance() else {
             return Ok(());
@@ -9858,6 +9915,8 @@ mod main_tests {
 
     #[cfg(windows)]
     use super::{oauth_prepare_error_from_output, run_hidden_powershell_output};
+    #[cfg(not(windows))]
+    use super::lock_single_instance_file;
 
     use super::{
         advance_overwrite_countdown, append_bounded_log, auto_enable_first_oauth_model,
@@ -11163,6 +11222,8 @@ mod main_tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    // Windows-only: asserts the %ProgramData% system layer is preserved.
+    #[cfg(windows)]
     #[test]
     fn exit_keeps_a_legal_system_identity_instead_of_deleting_it() {
         let root = std::env::temp_dir().join(format!(
@@ -11649,6 +11710,16 @@ mod main_tests {
             request_result_disposition(closed_generation, "", 42, "openai"),
             RequestResultDisposition::Ignore
         );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn single_instance_lock_excludes_a_second_holder() {
+        let first = lock_single_instance_file().unwrap();
+        assert!(first.is_some());
+        assert!(lock_single_instance_file().unwrap().is_none());
+        drop(first);
+        assert!(lock_single_instance_file().unwrap().is_some());
     }
 
     #[cfg(windows)]

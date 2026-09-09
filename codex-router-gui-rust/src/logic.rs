@@ -2860,22 +2860,94 @@ fn crypt_protect_for_current_user(data: &[u8]) -> anyhow::Result<Vec<u8>> {
     #[cfg(windows)]
     return crypt_dpapi(data, true);
     #[cfg(not(windows))]
-    {
-        let _ = data;
-        // Mac 首版：DPAPI 不存在，加密降级为原样返回（文件不加密，仅透传字节）。
-        Ok(data.to_vec())
-    }
+    return crypt_keychain_aead(data, true);
 }
 
 fn crypt_unprotect_for_current_user(data: &[u8]) -> anyhow::Result<Vec<u8>> {
     #[cfg(windows)]
     return crypt_dpapi(data, false);
     #[cfg(not(windows))]
-    {
-        let _ = data;
-        // Mac 首版：DPAPI 不存在，解密降级为原样返回（透传字节）。
-        Ok(data.to_vec())
+    return crypt_keychain_aead(data, false);
+}
+
+/// macOS/Unix DPAPI equivalent: AES-256-GCM with a per-user data-encryption
+/// key kept in the OS credential store (`crate::credentials`, i.e. Keychain
+/// on macOS). Blob layout: `b"CR1"` + 12-byte random nonce + ciphertext+tag.
+/// Blobs without the magic are pre-encryption legacy files and pass through
+/// so the first encrypted release keeps reading them.
+#[cfg(not(windows))]
+fn crypt_keychain_aead(data: &[u8], protect: bool) -> anyhow::Result<Vec<u8>> {
+    use aes_gcm::{aead::Aead, Aes256Gcm, KeyInit};
+
+    const MAGIC: &[u8; 3] = b"CR1";
+    const NONCE_LEN: usize = 12;
+
+    if !protect {
+        let Some(payload) = data.strip_prefix(MAGIC) else {
+            return Ok(data.to_vec());
+        };
+        let (nonce, ciphertext) = payload
+            .split_at_checked(NONCE_LEN)
+            .context("protected file is truncated")?;
+        let key = file_protection_key()?;
+        let cipher = Aes256Gcm::new_from_slice(key.as_ref())
+            .map_err(|_| anyhow::anyhow!("file protection key is invalid"))?;
+        let plaintext = cipher
+            .decrypt(aes_gcm::Nonce::from_slice(nonce), ciphertext)
+            .map_err(|_| {
+                anyhow::anyhow!("protected file failed authentication (wrong key or corrupted)")
+            })?;
+        Ok(plaintext)
+    } else {
+        let key = file_protection_key()?;
+        let cipher = Aes256Gcm::new_from_slice(key.as_ref())
+            .map_err(|_| anyhow::anyhow!("file protection key is invalid"))?;
+        let mut nonce_bytes = [0u8; NONCE_LEN];
+        secure_random_bytes(&mut nonce_bytes).context("failed to generate file nonce")?;
+        let ciphertext = cipher
+            .encrypt(aes_gcm::Nonce::from_slice(&nonce_bytes), data)
+            .map_err(|_| anyhow::anyhow!("file protection failed"))?;
+        let mut out = Vec::with_capacity(MAGIC.len() + NONCE_LEN + ciphertext.len());
+        out.extend_from_slice(MAGIC);
+        out.extend_from_slice(&nonce_bytes);
+        out.extend_from_slice(&ciphertext);
+        Ok(out)
     }
+}
+
+/// Load (or first-create) the 32-byte file-encryption key, hex-encoded in
+/// the OS credential store alongside the other Router secrets.
+#[cfg(not(windows))]
+fn file_protection_key() -> anyhow::Result<zeroize::Zeroizing<[u8; 32]>> {
+    const DEK_CREDENTIAL: &str = "FileProtectionKey";
+
+    if let Some(stored) = crate::credentials::read_text(DEK_CREDENTIAL)? {
+        let bytes = hex_decode(stored.trim()).context("file protection key is corrupt")?;
+        let key: [u8; 32] = bytes
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("file protection key has wrong length"))?;
+        return Ok(zeroize::Zeroizing::new(key));
+    }
+    let mut raw = [0u8; 32];
+    secure_random_bytes(&mut raw).context("failed to generate file protection key")?;
+    let key = zeroize::Zeroizing::new(raw);
+    crate::credentials::write_text(DEK_CREDENTIAL, &hex_encode(key.as_ref()))?;
+    Ok(key)
+}
+
+fn hex_decode(value: &str) -> anyhow::Result<Vec<u8>> {
+    if !value.len().is_multiple_of(2) {
+        anyhow::bail!("hex string has odd length");
+    }
+    value
+        .as_bytes()
+        .chunks(2)
+        .map(|pair| {
+            let word =
+                std::str::from_utf8(pair).context("hex string is not ASCII")?;
+            u8::from_str_radix(word, 16).context("hex string is invalid")
+        })
+        .collect()
 }
 
 #[cfg(windows)]
@@ -5812,6 +5884,34 @@ base_url = "https://api.430123.xyz/v1"
             ..Default::default()
         };
         assert!(resolve_model_api_key(&model).unwrap().is_none());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn keychain_file_protection_round_trips_and_rejects_tampering() {
+        let original = br#"{"auth_mode":"chatgpt","tokens":{"access_token":"not-a-real-token"}}"#;
+        let protected = crypt_protect_for_current_user(original).unwrap();
+        assert!(protected.starts_with(b"CR1"));
+        assert_ne!(protected.as_slice(), original.as_slice());
+        // The secret must not appear anywhere in the blob.
+        assert!(!protected
+            .windows(b"not-a-real-token".len())
+            .any(|window| window == b"not-a-real-token"));
+        // Nonces are random: two encryptions differ.
+        let again = crypt_protect_for_current_user(original).unwrap();
+        assert_ne!(protected, again);
+        assert_eq!(crypt_unprotect_for_current_user(&protected).unwrap(), original);
+        // Tampering fails authentication instead of yielding garbage.
+        let mut tampered = protected.clone();
+        let last = tampered.len() - 1;
+        tampered[last] ^= 0x01;
+        assert!(crypt_unprotect_for_current_user(&tampered).is_err());
+        // Legacy pre-encryption files pass through so upgrades keep working.
+        assert_eq!(
+            crypt_unprotect_for_current_user(original).unwrap(),
+            original.to_vec()
+        );
+        assert!(crypt_unprotect_for_current_user(b"CR1short").is_err());
     }
 
     #[test]

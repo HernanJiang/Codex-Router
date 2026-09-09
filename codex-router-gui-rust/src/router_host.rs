@@ -224,13 +224,9 @@ async fn start_cli(root: &Path, config_path: &Path) -> Result<Child> {
             actual_hash
         );
     }
-    // The Gemini CLI plugin ships Windows-only; the upstream darwin package
-    // bundles no plugin, so macOS skips the plugin lock.
-    #[cfg(windows)]
-    {
-        let Some(plugin_relative) = config_compiler::gemini_plugin_relative_path() else {
-            bail!("CR-CLI-0001: locked Gemini CLI plugin path is unavailable");
-        };
+    // The Gemini CLI plugin ships for Windows (.dll) and macOS (.dylib);
+    // platforms without a plugin build skip the lock.
+    if let Some(plugin_relative) = config_compiler::gemini_plugin_relative_path() {
         let plugin = root.join(plugin_relative);
         if !plugin.is_file() {
             bail!("CR-CLI-0001: locked Gemini CLI plugin is missing");
@@ -2041,6 +2037,24 @@ where
     )
 }
 
+/// Shutdown trigger: Ctrl-C everywhere, plus SIGTERM on Unix so the GUI
+/// lifecycle stop (which signals the host) shuts down gracefully and takes
+/// the managed CLI child with it instead of orphaning it.
+#[cfg(unix)]
+async fn shutdown_signal() {
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("could not listen for SIGTERM");
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {},
+        _ = terminate.recv() => {},
+    }
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal() {
+    let _ = tokio::signal::ctrl_c().await;
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let root = router_root();
@@ -2141,7 +2155,7 @@ async fn main() -> Result<()> {
     let shutdown_child = state.cli_child.clone();
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
-            let _ = tokio::signal::ctrl_c().await;
+            shutdown_signal().await;
             let child = shutdown_child
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())

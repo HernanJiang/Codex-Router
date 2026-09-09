@@ -20,11 +20,15 @@ The bundled `app/cli-proxy-api.exe` is the audited `v7.2.135` Windows amd64 buil
 ## Gemini CLI plugin
 
 - Project: Gemini CLI plugin (CLIProxyAPI plugin ABI)
+- Upstream: https://github.com/router-for-me/cpa-plugin-gemini-cli
 - Version: 1.0.5
 - Role: provides the Gemini CLI OAuth login entry (Google One Free and Code Assist project/tier) used by the Router's Gemini OAuth flow
 - License: MIT (distributed under the CLIProxyAPI plugin SDK terms)
-- Bundled file: `app/plugins/windows/amd64/gemini-cli-v1.0.5.dll`
-- Bundled file SHA-256: `c1d849f13270329bff9f4d8ab8ef7507eba57642402beb19c60e66ecc2e40cee`
+- Bundled file (Windows): `app/plugins/windows/amd64/gemini-cli-v1.0.5.dll`
+- Bundled file (Windows) SHA-256: `c1d849f13270329bff9f4d8ab8ef7507eba57642402beb19c60e66ecc2e40cee`
+- Bundled file (macOS arm64): `app/plugins/darwin/arm64/gemini-cli.dylib`
+- Bundled file (macOS arm64) SHA-256: `4fbac8a964467c477db9975f9ec38e35254ea60fb950b67418a063b2cde20f1b`
+- macOS arm64 asset (`gemini-cli_1.0.5_darwin_arm64.zip`) SHA-256: `3c771ff57e607b40bf95753e0ad2fb01127a296fe4cbff79b49116cd2327b5bb` (matches upstream `checksums.txt`)
 
 The plugin is loaded by the bundled CLIProxyAPI through its plugin ABI. The release builder verifies the pinned hash before staging.
 

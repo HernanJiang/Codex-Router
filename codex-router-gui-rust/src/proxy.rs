@@ -383,6 +383,18 @@ fn preferred_candidate(candidates: ProxyServerCandidates) -> Option<String> {
     candidates.https.or(candidates.all).or(candidates.http)
 }
 
+/// User-visible source label for the OS-level (non-environment) proxy slot:
+/// Windows registry/WinHTTP vs macOS SystemConfiguration.
+fn system_proxy_source_label() -> &'static str {
+    if cfg!(windows) {
+        "windows"
+    } else if cfg!(target_os = "macos") {
+        "macos"
+    } else {
+        "system"
+    }
+}
+
 fn resolve(
     config: &ProxyConfig,
     password: Option<&str>,
@@ -453,7 +465,7 @@ fn resolve(
                 if settings.proxy_enabled {
                     proxy_url = preferred_candidate(parse_proxy_server(&settings.proxy_server));
                     if proxy_url.is_some() {
-                        source = "windows".to_owned();
+                        source = system_proxy_source_label().to_owned();
                         bypass.push(settings.proxy_override.clone());
                     }
                 }
@@ -603,6 +615,107 @@ fn machine_winhttp() -> Option<WinHttpSettings> {
     })
 }
 
+#[cfg(target_os = "macos")]
+fn macos_system_proxy() -> Option<InternetSettings> {
+    let output = std::process::Command::new("scutil")
+        .args(["--proxy"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(parse_scutil_proxy(&String::from_utf8_lossy(&output.stdout)))
+}
+
+/// Parse `scutil --proxy` plist-style output into the shared
+/// `InternetSettings` shape (enabled flag, `proto=host:port` server list,
+/// `;`-joined bypass list). Pure function so it is unit-testable without
+/// touching the system configuration.
+#[cfg(target_os = "macos")]
+fn parse_scutil_proxy(text: &str) -> InternetSettings {
+    fn push_exception(out: &mut Vec<String>, raw: &str) {
+        // Item forms: `*.local`, `0 : 127.0.0.1`, `<local>`.
+        let item = raw.trim();
+        let item = match item.split_once(':') {
+            Some((index, pattern))
+                if index.trim().chars().all(|c| c.is_ascii_digit()) =>
+            {
+                pattern.trim()
+            }
+            _ => item,
+        };
+        if !item.is_empty() && item != "<array>" && item != "{" && item != "}" {
+            out.push(item.to_owned());
+        }
+    }
+
+    let mut values = std::collections::BTreeMap::<String, String>::new();
+    let mut exceptions = Vec::<String>::new();
+    let mut in_exceptions = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if in_exceptions {
+            if line.starts_with('}') {
+                in_exceptions = false;
+                continue;
+            }
+            for item in line.split(',') {
+                push_exception(&mut exceptions, item);
+            }
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("ExceptionsList") {
+            in_exceptions = true;
+            // Same-line items, if any: `... { 0 : *.local, ... }`.
+            if let Some((_, tail)) = rest.split_once('{') {
+                for item in tail.split([',', '}']) {
+                    push_exception(&mut exceptions, item);
+                }
+                if rest.contains('}') {
+                    in_exceptions = false;
+                }
+            }
+            continue;
+        }
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        values.insert(key.trim().to_owned(), value.trim().to_owned());
+    }
+    let flag = |key: &str| values.get(key).is_some_and(|v| v == "1");
+    let endpoint = |proto: &str| {
+        let (host_key, port_key) = match proto {
+            "http" => ("HTTPProxy", "HTTPPort"),
+            "https" => ("HTTPSProxy", "HTTPSPort"),
+            "socks" => ("SOCKSProxy", "SOCKSPort"),
+            _ => return None,
+        };
+        let host = values.get(host_key)?.trim();
+        let port = values.get(port_key)?.trim().parse::<u16>().ok()?;
+        if host.is_empty() || port == 0 {
+            return None;
+        }
+        Some(format!("{proto}={host}:{port}"))
+    };
+    let mut servers = Vec::new();
+    for proto in ["http", "https", "socks"] {
+        let enabled = match proto {
+            "http" => flag("HTTPEnable"),
+            "https" => flag("HTTPSEnable"),
+            _ => flag("SOCKSEnable"),
+        };
+        if enabled {
+            servers.extend(endpoint(proto));
+        }
+    }
+    InternetSettings {
+        proxy_enabled: !servers.is_empty(),
+        proxy_server: servers.join(";"),
+        proxy_override: exceptions.join(";"),
+    }
+}
+
 fn current_sources() -> ProxySources {
     let mut environment = BTreeMap::new();
     for name in [
@@ -629,7 +742,9 @@ fn current_sources() -> ProxySources {
         current_user_winhttp(),
         machine_winhttp(),
     );
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    let (internet, current_user, machine) = (macos_system_proxy(), None, None);
+    #[cfg(not(any(windows, target_os = "macos")))]
     let (internet, current_user, machine) = (None, None, None);
     ProxySources {
         environment,
@@ -707,7 +822,7 @@ mod tests {
 
         sources.environment.clear();
         let windows = resolve(&auto_config(), None, &sources).unwrap();
-        assert_eq!(windows.source, "windows");
+        assert_eq!(windows.source, system_proxy_source_label());
         assert_eq!(windows.proxy_url.as_deref(), Some("http://127.0.0.1:3081"));
         assert!(windows.no_proxy.contains(".cn"));
         assert!(windows.no_proxy.contains("10.0.0.0/8"));
@@ -756,7 +871,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_environment_proxy_falls_back_to_windows() {
+    fn invalid_environment_proxy_falls_back_to_system_slot() {
         let mut sources = ProxySources::default();
         sources
             .environment
@@ -767,8 +882,68 @@ mod tests {
             proxy_override: String::new(),
         });
         let settings = resolve(&auto_config(), None, &sources).unwrap();
-        assert_eq!(settings.source, "windows");
+        assert_eq!(settings.source, system_proxy_source_label());
         assert_eq!(settings.proxy_url.as_deref(), Some("http://127.0.0.1:5080"));
+    }
+
+    #[test]
+    fn system_slot_uses_the_platform_source_label() {
+        let mut sources = ProxySources::default();
+        sources.internet = Some(InternetSettings {
+            proxy_enabled: true,
+            proxy_server: "https=127.0.0.1:8081".into(),
+            proxy_override: "*.example".into(),
+        });
+        let settings = resolve(&auto_config(), None, &sources).unwrap();
+        assert_eq!(settings.source, system_proxy_source_label());
+        assert_eq!(
+            settings.proxy_url.as_deref(),
+            Some("http://127.0.0.1:8081")
+        );
+        assert!(settings.no_proxy.contains(".example"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn scutil_proxy_parses_endpoints_and_bypass_list() {
+        // Multi-line form as printed by the real `scutil --proxy`.
+        let text = "<dictionary> {
+  ExceptionsList : <array> {
+    0 : 127.0.0.1
+    1 : 10.0.0.0/8
+    2 : *.example.com
+    3 : <local>
+  }
+  HTTPEnable : 1
+  HTTPPort : 7890
+  HTTPProxy : 127.0.0.1
+  HTTPSEnable : 1
+  HTTPSPort : 7890
+  HTTPSProxy : 127.0.0.1
+  SOCKSEnable : 0
+  SOCKSPort : 0
+}";
+        let settings = parse_scutil_proxy(text);
+        assert!(settings.proxy_enabled);
+        assert_eq!(
+            preferred_candidate(parse_proxy_server(&settings.proxy_server)).as_deref(),
+            Some("http://127.0.0.1:7890")
+        );
+        assert!(settings.proxy_override.contains("*.example.com"));
+        assert!(settings.proxy_override.contains("10.0.0.0/8"));
+        assert!(settings.proxy_override.contains("<local>"));
+
+        let disabled = parse_scutil_proxy("<dictionary> {\n  HTTPEnable : 0\n}");
+        assert!(!disabled.proxy_enabled);
+        assert!(disabled.proxy_server.is_empty());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn scutil_proxy_live_query_runs_without_panicking() {
+        // Values depend on the machine; this only pins the wiring.
+        let _ = macos_system_proxy();
+        let _ = resolve_current(&auto_config(), None).map(|settings| settings.mode.clone());
     }
 
     #[test]
