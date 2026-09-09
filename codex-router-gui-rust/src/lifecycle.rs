@@ -1,35 +1,48 @@
 use crate::config::RouterConfig;
 use crate::{config, logic, user_data};
 use anyhow::{bail, Context};
+use codex_router_lib::backend::config_compiler as cli_compiler;
 use serde::Serialize;
+#[cfg(windows)]
 use std::collections::HashSet;
+#[cfg(windows)]
 use std::ffi::OsStr;
 use std::fs::File;
 use std::io::Write;
+#[cfg(any(windows, test))]
 use std::net::Ipv4Addr;
+#[cfg(windows)]
 use std::os::windows::ffi::OsStrExt;
+#[cfg(windows)]
 use std::os::windows::io::FromRawHandle;
+#[cfg(windows)]
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
+#[cfg(windows)]
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_INSUFFICIENT_BUFFER, ERROR_SHARING_VIOLATION, GENERIC_READ, GENERIC_WRITE,
     INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
 };
+#[cfg(windows)]
 use windows_sys::Win32::NetworkManagement::IpHelper::{
     GetExtendedTcpTable, MIB_TCPROW_OWNER_PID, MIB_TCP_STATE_ESTAB, MIB_TCP_STATE_LISTEN,
     TCP_TABLE_OWNER_PID_ALL,
 };
+#[cfg(windows)]
 use windows_sys::Win32::Networking::WinSock::AF_INET;
+#[cfg(windows)]
 use windows_sys::Win32::Storage::FileSystem::{CreateFileW, FILE_ATTRIBUTE_NORMAL, OPEN_ALWAYS};
+#[cfg(windows)]
 use windows_sys::Win32::System::Threading::{
     OpenProcess, QueryFullProcessImageNameW, TerminateProcess, WaitForSingleObject,
     CREATE_NEW_PROCESS_GROUP, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
     PROCESS_TERMINATE,
 };
 
+#[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const DEFAULT_CLI_PORT: u16 = 18_081;
 
@@ -118,13 +131,24 @@ fn is_port_conflict_error(error: &anyhow::Error) -> bool {
 }
 
 fn gateway_port_usable(port: u16) -> bool {
-    let Ok(rows) = tcp_rows() else {
-        return false;
-    };
-    let current = std::process::id();
-    rows.into_iter()
-        .filter(|row| row.dwState == MIB_TCP_STATE_LISTEN as u32 && row_port(row) == port)
-        .all(|row| row.dwOwningPid == current)
+    #[cfg(windows)]
+    {
+        let Ok(rows) = tcp_rows() else {
+            return false;
+        };
+        let current = std::process::id();
+        return rows
+            .into_iter()
+            .filter(|row| row.dwState == MIB_TCP_STATE_LISTEN as u32 && row_port(row) == port)
+            .all(|row| row.dwOwningPid == current);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = port;
+        // Non-Windows first version: no TCP owner table; assume the port is
+        // usable so port adoption does not spuriously rewrite the config.
+        true
+    }
 }
 
 /// Listener owned by *this* installation. A foreign Router copy or an
@@ -202,11 +226,34 @@ impl ServiceKind {
 #[derive(Debug)]
 pub struct LifecycleLock {
     _file: Option<File>,
+    lock_path: Option<PathBuf>,
 }
 
 impl LifecycleLock {
     fn inherited() -> Self {
-        Self { _file: None }
+        Self {
+            _file: None,
+            lock_path: None,
+        }
+    }
+}
+
+impl Drop for LifecycleLock {
+    fn drop(&mut self) {
+        // Releasing the lock must free it for the next owner on every
+        // platform. Windows leans on the open-handle share lock, but the
+        // `create_new` file on other platforms persists after close, so
+        // remove it — but only when it still carries our own PID, otherwise
+        // a successor's lock file could be deleted out from under it.
+            if let Some(path) = self.lock_path.take() {
+            let ours = format!("pid={}", std::process::id());
+            let owned = std::fs::read_to_string(&path)
+                .map(|content| content.lines().next() == Some(ours.as_str()))
+                .unwrap_or(false);
+            if owned {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
     }
 }
 
@@ -218,40 +265,84 @@ pub fn acquire_lifecycle_lock(
     let lock_directory = user_data::data_root(router_root).join("locks");
     std::fs::create_dir_all(&lock_directory)?;
     let lock_path = lock_directory.join("service-lifecycle.lock");
-    let lock_path_wide = wide(&lock_path);
-    let started = Instant::now();
-    loop {
-        let handle = unsafe {
-            CreateFileW(
-                lock_path_wide.as_ptr(),
-                GENERIC_READ | GENERIC_WRITE,
-                0,
-                std::ptr::null(),
-                OPEN_ALWAYS,
-                FILE_ATTRIBUTE_NORMAL,
-                std::ptr::null_mut(),
-            )
-        };
-        if handle != INVALID_HANDLE_VALUE {
-            let mut file = unsafe { File::from_raw_handle(handle) };
-            file.set_len(0)?;
-            write!(
-                file,
-                "pid={}\r\noperation={}\r\n",
-                std::process::id(),
-                operation
-            )?;
-            file.sync_all()?;
-            return Ok(LifecycleLock { _file: Some(file) });
+    #[cfg(windows)]
+    {
+        let lock_path_wide = wide(&lock_path);
+        let started = Instant::now();
+        loop {
+            let handle = unsafe {
+                CreateFileW(
+                    lock_path_wide.as_ptr(),
+                    GENERIC_READ | GENERIC_WRITE,
+                    0,
+                    std::ptr::null(),
+                    OPEN_ALWAYS,
+                    FILE_ATTRIBUTE_NORMAL,
+                    std::ptr::null_mut(),
+                )
+            };
+            if handle != INVALID_HANDLE_VALUE {
+                let mut file = unsafe { File::from_raw_handle(handle) };
+                file.set_len(0)?;
+                write!(
+                    file,
+                    "pid={}\r\noperation={}\r\n",
+                    std::process::id(),
+                    operation
+                )?;
+                file.sync_all()?;
+                return Ok(LifecycleLock {
+                    _file: Some(file),
+                    lock_path: Some(lock_path),
+                });
+            }
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(ERROR_SHARING_VIOLATION as i32) {
+                return Err(error).context("ROUTER_LIFECYCLE_LOCK_FAILED");
+            }
+            if started.elapsed() >= timeout {
+                bail!("ROUTER_LIFECYCLE_BUSY: Timed out waiting for another Start, Stop, Apply, or OAuth startup operation.");
+            }
+            std::thread::sleep(Duration::from_millis(75));
         }
-        let error = std::io::Error::last_os_error();
-        if error.raw_os_error() != Some(ERROR_SHARING_VIOLATION as i32) {
-            return Err(error).context("ROUTER_LIFECYCLE_LOCK_FAILED");
+    }
+    #[cfg(not(windows))]
+    {
+        // Non-Windows lock: create the lock file exclusively. `create_new(true)`
+        // fails with AlreadyExists when another process holds it, which keeps
+        // the same acquire/timeout semantics as the Windows share violation,
+        // without the Windows-only `File::from_raw_handle`.
+        let started = Instant::now();
+        loop {
+            match std::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&lock_path)
+            {
+                Ok(mut file) => {
+                    write!(
+                        file,
+                        "pid={}\noperation={}\n",
+                        std::process::id(),
+                        operation
+                    )?;
+                    file.sync_all()?;
+                    return Ok(LifecycleLock {
+                        _file: Some(file),
+                        lock_path: Some(lock_path),
+                    });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if started.elapsed() >= timeout {
+                        bail!("ROUTER_LIFECYCLE_BUSY: Timed out waiting for another Start, Stop, Apply, or OAuth startup operation.");
+                    }
+                    std::thread::sleep(Duration::from_millis(75));
+                }
+                Err(error) => {
+                    return Err(error).context("ROUTER_LIFECYCLE_LOCK_FAILED");
+                }
+            }
         }
-        if started.elapsed() >= timeout {
-            bail!("ROUTER_LIFECYCLE_BUSY: Timed out waiting for another Start, Stop, Apply, or OAuth startup operation.");
-        }
-        std::thread::sleep(Duration::from_millis(75));
     }
 }
 fn environment_port(name: &str, fallback: u16) -> anyhow::Result<u16> {
@@ -298,6 +389,7 @@ fn loopback_base_uri(value: &str) -> anyhow::Result<url::Url> {
     Ok(url)
 }
 
+#[cfg(windows)]
 fn wide(value: impl AsRef<OsStr>) -> Vec<u16> {
     value.as_ref().encode_wide().chain(Some(0)).collect()
 }
@@ -315,6 +407,7 @@ fn paths_equal(left: &Path, right: &Path) -> bool {
         .eq_ignore_ascii_case(&right.to_string_lossy())
 }
 
+#[cfg(windows)]
 fn process_path(process_id: u32) -> anyhow::Result<PathBuf> {
     let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, process_id) };
     if handle.is_null() {
@@ -334,10 +427,49 @@ fn process_path(process_id: u32) -> anyhow::Result<PathBuf> {
     Ok(PathBuf::from(String::from_utf16(&buffer)?))
 }
 
-fn process_exists(process_id: u32) -> bool {
-    process_path(process_id).is_ok()
+#[cfg(not(windows))]
+fn process_path(process_id: u32) -> anyhow::Result<PathBuf> {
+    // Unix: resolve argv[0] through `ps`. A full image path needs elevated
+    // APIs; argv[0] carries the absolute path for processes we spawn ourselves
+    // (host/CLI), which is what the same-service-image check needs. Anything
+    // unresolvable (reaped PID, foreign command line) reports unavailable so
+    // callers treat the process as unmanaged.
+    let output = Command::new("ps")
+        .args(["-p", &process_id.to_string(), "-o", "command="])
+        .stdin(Stdio::null())
+        .output()
+        .context("could not query the process table")?;
+    if !output.status.success() {
+        bail!("process {process_id} is not running");
+    }
+    let line = String::from_utf8_lossy(&output.stdout);
+    let executable = line.split_whitespace().next().unwrap_or_default();
+    if executable.is_empty() {
+        bail!("process {process_id} has no executable");
+    }
+    Ok(PathBuf::from(executable))
 }
 
+fn process_exists(process_id: u32) -> bool {
+    #[cfg(windows)]
+    {
+        process_path(process_id).is_ok()
+    }
+    #[cfg(not(windows))]
+    {
+        // signal 0 performs no action; ESRCH means absent, EPERM means a
+        // process exists but belongs to another user.
+        let pid = process_id as libc::pid_t;
+        if pid <= 0 {
+            return false;
+        }
+        let probe = unsafe { libc::kill(pid, 0) };
+        probe == 0
+            || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM as i32)
+    }
+}
+
+#[cfg(windows)]
 fn tcp_rows() -> anyhow::Result<Vec<MIB_TCPROW_OWNER_PID>> {
     let mut required = 0u32;
     let first = unsafe {
@@ -381,9 +513,11 @@ fn tcp_rows() -> anyhow::Result<Vec<MIB_TCPROW_OWNER_PID>> {
         .collect())
 }
 
+#[cfg(windows)]
 fn row_port(row: &MIB_TCPROW_OWNER_PID) -> u16 {
     u16::from_be((row.dwLocalPort & 0xffff) as u16)
 }
+#[cfg(windows)]
 fn listener_process_id(
     port: u16,
     expected_path: &Path,
@@ -436,18 +570,109 @@ fn listener_process_id(
     Ok(Some(process_id))
 }
 
+#[cfg(not(windows))]
+fn listener_process_id(
+    port: u16,
+    expected_path: &Path,
+    kind: ServiceKind,
+) -> anyhow::Result<Option<u32>> {
+    let Some(occupant) = loopback_listener_pid(port)? else {
+        return Ok(None);
+    };
+    // Same taxonomy as the Windows owner-table path so callers behave
+    // identically: foreign listeners are hard errors, same-installation
+    // listeners are claimed, other Router copies surface as conflicts.
+    let actual = process_path(occupant).map_err(|_| {
+        anyhow::anyhow!(
+            "ROUTER_PORT_CONFLICT: {} port {port} is owned by an unidentified process",
+            kind.name()
+        )
+    })?;
+    if paths_equal(&actual, expected_path) {
+        return Ok(Some(occupant));
+    }
+    if same_service_image(&actual, expected_path) {
+        bail!("ROUTER_INSTALL_ROOT_CONFLICT: {} port {port} belongs to another Codex-Router installation", kind.name());
+    }
+    bail!(
+        "ROUTER_PORT_CONFLICT: {} port {port} belongs to another program",
+        kind.name()
+    );
+}
+
+/// Unix loopback listener lookup through `lsof`. Missing `lsof` (minimal
+/// Linux containers) degrades to "no listener", the same as the old no-op;
+/// a busy port then surfaces as a bind error instead of a managed sweep.
+/// Mirrors the Windows `loopback_listener_pid` contract: non-loopback or
+/// ambiguous listeners report `None` instead of erroring.
+#[cfg(not(windows))]
+fn loopback_listener_pid(port: u16) -> anyhow::Result<Option<u32>> {
+    let output = match Command::new("lsof")
+        .args([
+            format!("-iTCP:{port}"),
+            "-sTCP:LISTEN".to_owned(),
+            "-P".to_owned(),
+            "-n".to_owned(),
+            "-Fn".to_owned(),
+        ])
+        .stdin(Stdio::null())
+        .output()
+    {
+        Ok(output) => output,
+        Err(_) => return Ok(None),
+    };
+    if !output.status.success() {
+        return Ok(None);
+    }
+    // Endpoint forms: `127.0.0.1:18080`, `[::1]:18080`, `*:18080`.
+    fn is_loopback(endpoint: &str) -> bool {
+        endpoint.starts_with("127.0.0.1:")
+            || endpoint.starts_with("localhost:")
+            || endpoint.starts_with("[::1]:")
+    }
+    let mut owners = std::collections::HashSet::new();
+    let mut current: Option<u32> = None;
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        if let Some(pid) = line.strip_prefix('p') {
+            current = pid.parse::<u32>().ok();
+        } else if let Some(endpoint) = line.strip_prefix('n') {
+            if !is_loopback(endpoint) {
+                return Ok(None);
+            }
+            if let Some(pid) = current {
+                owners.insert(pid);
+            }
+        }
+    }
+    if owners.len() == 1 {
+        Ok(owners.into_iter().next())
+    } else {
+        Ok(None)
+    }
+}
+
 pub fn established_connection_count(process_id: u32, port: u16) -> anyhow::Result<usize> {
-    tcp_rows()
-        .map(|rows| {
-            rows.into_iter()
-                .filter(|row| {
-                    row.dwState == MIB_TCP_STATE_ESTAB as u32
-                        && row.dwOwningPid == process_id
-                        && row_port(row) == port
-                })
-                .count()
-        })
-        .context("ROUTER_LIFECYCLE_SAFETY_CHECK_FAILED")
+    #[cfg(windows)]
+    {
+        return tcp_rows()
+            .map(|rows| {
+                rows.into_iter()
+                    .filter(|row| {
+                        row.dwState == MIB_TCP_STATE_ESTAB as u32
+                            && row.dwOwningPid == process_id
+                            && row_port(row) == port
+                    })
+                    .count()
+            })
+            .context("ROUTER_LIFECYCLE_SAFETY_CHECK_FAILED");
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (process_id, port);
+        // Safe degradation: established-connection counting is not implemented
+        // without the TCP owner table; report zero active connections.
+        Ok(0)
+    }
 }
 
 fn assert_interruption_allowed(process_id: u32, port: u16, operation: &str) -> anyhow::Result<()> {
@@ -462,6 +687,7 @@ fn terminate_verified_process(process_id: u32, expected_path: &Path) -> anyhow::
     terminate_managed_process(process_id, expected_path, None)
 }
 
+#[cfg(windows)]
 fn terminate_managed_process(
     process_id: u32,
     expected_path: &Path,
@@ -501,6 +727,70 @@ fn terminate_managed_process(
     Ok(())
 }
 
+#[cfg(not(windows))]
+fn terminate_managed_process(
+    process_id: u32,
+    expected_path: &Path,
+    pid_file: Option<&Path>,
+) -> anyhow::Result<()> {
+    let pid_file = pid_file.unwrap_or_else(|| Path::new(""));
+    if !process_is_managed(process_id, expected_path, pid_file) {
+        if !process_exists(process_id) {
+            return Ok(());
+        }
+        bail!("refusing to terminate an unverified process");
+    }
+    unix_terminate_process(process_id)
+}
+
+/// True once a process is gone. A SIGKILLed child of this process lingers as
+/// a zombie until reaped, and `kill(pid, 0)` still reports zombies as alive,
+/// so reap our own children with `waitpid(WNOHANG)`; anything else falls back
+/// to the existence probe (reparented orphans are reaped by init).
+#[cfg(not(windows))]
+fn reaped_or_gone(process_id: u32) -> bool {
+    let mut status = 0 as libc::c_int;
+    let waited = unsafe { libc::waitpid(process_id as libc::pid_t, &mut status, libc::WNOHANG) };
+    if waited == process_id as libc::pid_t {
+        return true;
+    }
+    if waited == 0 {
+        return false;
+    }
+    !process_exists(process_id)
+}
+
+/// SIGTERM, wait up to 10s, then SIGKILL. Shared by the managed and
+/// same-image Unix termination paths.
+#[cfg(not(windows))]
+fn unix_terminate_process(process_id: u32) -> anyhow::Result<()> {    fn signal(pid: u32, number: libc::c_int) {
+        unsafe {
+            libc::kill(pid as libc::pid_t, number);
+        }
+    }
+    fn wait_exit(process_id: u32, timeout: Duration) -> bool {
+        let started = Instant::now();
+        while !reaped_or_gone(process_id) {
+            if started.elapsed() >= timeout {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        true
+    }
+    if !process_exists(process_id) {
+        return Ok(());
+    }
+    signal(process_id, libc::SIGTERM);    if !wait_exit(process_id, Duration::from_secs(10)) {
+        signal(process_id, libc::SIGKILL);
+        if !wait_exit(process_id, Duration::from_secs(10)) {
+            bail!("verified service process did not exit within 10 seconds");
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
 fn terminate_same_image_process(process_id: u32, expected_path: &Path) -> anyhow::Result<()> {
     let actual = match process_path(process_id) {
         Ok(path) => path,
@@ -537,6 +827,19 @@ fn terminate_same_image_process(process_id: u32, expected_path: &Path) -> anyhow
     Ok(())
 }
 
+#[cfg(not(windows))]
+fn terminate_same_image_process(process_id: u32, expected_path: &Path) -> anyhow::Result<()> {
+    let actual = match process_path(process_id) {
+        Ok(path) => path,
+        Err(_) if !process_exists(process_id) => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if !paths_equal(&actual, expected_path) && !same_service_image(&actual, expected_path) {
+        bail!("refusing to terminate an unverified process");
+    }
+    unix_terminate_process(process_id)
+}
+
 fn read_pid_file(path: &Path) -> Option<u32> {
     std::fs::read_to_string(path)
         .ok()
@@ -558,15 +861,21 @@ fn rotate_log(path: &Path) {
 }
 
 fn host_executable(router_root: &Path) -> PathBuf {
-    router_root.join(r"app\codex-router-host.exe")
+    router_root
+        .join("app")
+        .join(cli_compiler::host_executable_file_name())
 }
 
 fn cli_executable(router_root: &Path) -> PathBuf {
-    router_root.join(r"app\cli-proxy-api.exe")
+    router_root
+        .join("app")
+        .join(cli_compiler::cli_executable_file_name())
 }
 
 fn host_pid_file(router_root: &Path) -> PathBuf {
-    user_data::data_root(router_root).join(r"pids\router-host.pid")
+    user_data::data_root(router_root)
+        .join("pids")
+        .join("router-host.pid")
 }
 
 fn same_service_image(actual: &Path, expected: &Path) -> bool {
@@ -627,6 +936,7 @@ fn sweep_stale_router_listeners(
     Ok(())
 }
 
+#[cfg(windows)]
 fn loopback_listener_pid(port: u16) -> anyhow::Result<Option<u32>> {
     let listeners = tcp_rows()?
         .into_iter()
@@ -743,11 +1053,7 @@ fn cli_health(port: u16, timeout: Duration) -> bool {
 }
 
 fn ensure_required_layout(router_root: &Path) -> anyhow::Result<()> {
-    for relative in [
-        r"app\codex-router-host.exe",
-        r"app\cli-proxy-api.exe",
-        r"app\plugins\windows\amd64\gemini-cli-v1.0.5.dll",
-    ] {
+    for relative in cli_compiler::required_runtime_relative_paths() {
         if !router_root.join(relative).is_file() {
             bail!("Portable runtime is incomplete; missing: {relative}");
         }
@@ -792,8 +1098,9 @@ fn start_router_host(
         .current_dir(router_root.join("app"))
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
-        .stderr(Stdio::from(stderr))
-        .creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
+        .stderr(Stdio::from(stderr));
+    #[cfg(windows)]
+    command.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
     if let Some(proxy_url) = proxy_url.filter(|value| !value.trim().is_empty()) {
         command.env("CODEX_ROUTER_PROXY_URL", proxy_url);
     } else {
@@ -803,7 +1110,7 @@ fn start_router_host(
     let process_id = child.id();
     drop(child);
     config::atomic_write(
-        &data_root.join(r"pids\router-host.pid"),
+        &data_root.join("pids").join("router-host.pid"),
         process_id.to_string().as_bytes(),
     )?;
     Ok(process_id)
@@ -997,7 +1304,9 @@ pub fn ensure_services_with_config(
                 let _ = terminate_verified_process(cli_pid, &cli_expected);
             }
             let _ = std::fs::remove_file(
-                user_data::data_root(router_root).join(r"pids\router-host.pid"),
+                user_data::data_root(router_root)
+                    .join("pids")
+                    .join("router-host.pid"),
             );
             return Err(error);
         }
@@ -1114,8 +1423,8 @@ pub fn stop_services_with_config(
     };
     let _ = std::fs::remove_file(pid_file);
     // Drop stale pre-2.0 bookkeeping left behind by an upgraded installation.
-    let _ = std::fs::remove_file(data_root.join(r"pids\sub2api.pid"));
-    let _ = std::fs::remove_file(data_root.join(r"pids\sub2api-network.hmac"));
+    let _ = std::fs::remove_file(data_root.join("pids").join("sub2api.pid"));
+    let _ = std::fs::remove_file(data_root.join("pids").join("sub2api-network.hmac"));
     Ok(status)
 }
 
@@ -1164,7 +1473,9 @@ fn status_services_with_config(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{TcpListener, TcpStream};
+    use std::net::TcpListener;
+    #[cfg(windows)]
+    use std::net::TcpStream;
     use std::sync::{Mutex, OnceLock};
 
     fn port_test_lock() -> std::sync::MutexGuard<'static, ()> {
@@ -1174,6 +1485,7 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    #[cfg(windows)]
     fn wait_for_test_listener(port: u16) {
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
@@ -1214,6 +1526,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    #[cfg(windows)]
     #[test]
     fn windows_tcp_table_finds_this_process_listener_and_active_connection() {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
@@ -1285,6 +1598,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    #[cfg(windows)]
     #[test]
     fn adopt_scans_past_ports_owned_by_other_processes() {
         let _guard = port_test_lock();
@@ -1320,6 +1634,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    #[cfg(windows)]
     #[test]
     fn adopt_moves_when_only_the_derived_cli_port_is_foreign() {
         let _guard = port_test_lock();
@@ -1346,18 +1661,106 @@ mod tests {
 
     #[test]
     fn same_service_image_matches_filename_across_install_roots() {
+        // Forward slashes parse as separators on every platform, so this
+        // verifies the filename comparison on Windows and macOS alike.
         assert!(same_service_image(
-            Path::new(r"D:\Work\CodexRouter\Release\3.0.17\app\codex-router-host.exe"),
-            Path::new(r"D:\Work\CodexRouter\Release\3.0.18\app\codex-router-host.exe"),
+            Path::new("D:/Work/CodexRouter/Release/3.0.17/app/codex-router-host.exe"),
+            Path::new("D:/Work/CodexRouter/Release/3.0.18/app/codex-router-host.exe"),
         ));
         assert!(!same_service_image(
-            Path::new(r"D:\Work\CodexRouter\Release\3.0.17\app\codex-router-host.exe"),
-            Path::new(r"D:\Work\CodexRouter\Release\3.0.18\app\cli-proxy-api.exe"),
+            Path::new("D:/Work/CodexRouter/Release/3.0.17/app/codex-router-host.exe"),
+            Path::new("D:/Work/CodexRouter/Release/3.0.18/app/cli-proxy-api.exe"),
         ));
         let ports = router_host_port_candidates(28_080);
         assert!(ports.contains(&18_080));
         assert!(ports.contains(&28_080));
         assert!(ports.contains(&28_083));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn unix_process_primitives_see_this_process_and_reaped_children() {
+        assert!(process_exists(std::process::id()));
+        assert!(!process_exists(0));
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while process_exists(pid) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(!process_exists(pid));
+        assert!(process_path(std::process::id())
+            .unwrap()
+            .file_name()
+            .is_some());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn unix_terminate_managed_process_stops_a_matching_sleep() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("120")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        assert!(process_exists(pid));
+        let expected = PathBuf::from("sleep");
+        assert!(process_is_managed(pid, &expected, Path::new("")));
+        terminate_managed_process(pid, &expected, None).unwrap();
+        assert!(!process_exists(pid));
+        let _ = child.wait();
+        // launchd is never our image: refusal must come before any signal.
+        assert!(terminate_managed_process(1, &expected, None).is_err());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn unix_listener_lookup_resolves_this_process_listener() {
+        let _guard = port_test_lock();
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert_eq!(
+            loopback_listener_pid(port).unwrap(),
+            Some(std::process::id())
+        );
+        let expected = std::env::current_exe().unwrap();
+        match listener_process_id(port, &expected, ServiceKind::RouterHost) {
+            Ok(owner) => assert_eq!(owner, Some(std::process::id())),
+            // Acceptable when the test harness invokes the binary through a
+            // bare name: ownership still resolved, only exact-path equality
+            // could not be proven from argv[0].
+            Err(error) => assert!(
+                error.to_string().contains("ROUTER_INSTALL_ROOT_CONFLICT"),
+                "{error}"
+            ),
+        }
+        drop(listener);
+        assert_eq!(loopback_listener_pid(port).unwrap(), None);
+    }
+
+    #[test]
+    fn required_layout_matches_current_platform() {
+        let root = temporary_root("layout");
+        // Empty tree is incomplete on every platform.
+        assert!(ensure_required_layout(&root).is_err());
+        assert!(!RouterConfig::is_router_root(&root));
+        for relative in cli_compiler::required_runtime_relative_paths() {
+            let path = root.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"stub").unwrap();
+        }
+        assert!(ensure_required_layout(&root).is_ok());
+        assert!(RouterConfig::is_router_root(&root));
+        assert!(host_executable(&root).is_file());
+        assert!(cli_executable(&root).is_file());
+        assert_eq!(
+            host_pid_file(&root),
+            user_data::data_root(&root)
+                .join("pids")
+                .join("router-host.pid")
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

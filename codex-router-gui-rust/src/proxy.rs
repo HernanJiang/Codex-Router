@@ -5,16 +5,20 @@ use std::collections::{BTreeMap, HashSet};
 use std::net::IpAddr;
 use std::time::Duration;
 use url::Url;
+#[cfg(windows)]
 use windows_sys::Win32::Foundation::{GlobalFree, ERROR_SUCCESS};
+#[cfg(windows)]
 use windows_sys::Win32::Networking::WinHttp::{
     WinHttpGetDefaultProxyConfiguration, WinHttpGetIEProxyConfigForCurrentUser,
     WINHTTP_CURRENT_USER_IE_PROXY_CONFIG, WINHTTP_PROXY_INFO,
 };
+#[cfg(windows)]
 use windows_sys::Win32::System::Registry::{
     RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RRF_RT_REG_SZ,
 };
 use zeroize::Zeroize;
 
+#[cfg(windows)]
 const INTERNET_SETTINGS: &str = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings";
 const REQUIRED_NO_PROXY: [&str; 3] = ["127.0.0.1", "localhost", "::1"];
 
@@ -494,10 +498,12 @@ fn resolve(
     })
 }
 
+#[cfg(windows)]
 fn wide(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(Some(0)).collect()
 }
 
+#[cfg(windows)]
 fn registry_dword(name: &str) -> Option<u32> {
     let subkey = wide(INTERNET_SETTINGS);
     let name = wide(name);
@@ -517,6 +523,7 @@ fn registry_dword(name: &str) -> Option<u32> {
         .then_some(value)
 }
 
+#[cfg(windows)]
 fn registry_string(name: &str) -> Option<String> {
     let subkey = wide(INTERNET_SETTINGS);
     let name = wide(name);
@@ -558,6 +565,7 @@ fn registry_string(name: &str) -> Option<String> {
     String::from_utf16(&buffer[..length]).ok()
 }
 
+#[cfg(windows)]
 unsafe fn take_global_string(pointer: *mut u16) -> String {
     if pointer.is_null() {
         return String::new();
@@ -571,6 +579,7 @@ unsafe fn take_global_string(pointer: *mut u16) -> String {
     value
 }
 
+#[cfg(windows)]
 fn current_user_winhttp() -> Option<WinHttpSettings> {
     let mut settings = WINHTTP_CURRENT_USER_IE_PROXY_CONFIG::default();
     if unsafe { WinHttpGetIEProxyConfigForCurrentUser(&mut settings) } == 0 {
@@ -582,6 +591,7 @@ fn current_user_winhttp() -> Option<WinHttpSettings> {
     Some(WinHttpSettings { proxy, bypass })
 }
 
+#[cfg(windows)]
 fn machine_winhttp() -> Option<WinHttpSettings> {
     let mut settings = WINHTTP_PROXY_INFO::default();
     if unsafe { WinHttpGetDefaultProxyConfiguration(&mut settings) } == 0 {
@@ -609,15 +619,23 @@ fn current_sources() -> ProxySources {
             environment.insert(name.to_owned(), value);
         }
     }
-    ProxySources {
-        environment,
-        internet: Some(InternetSettings {
+    #[cfg(windows)]
+    let (internet, current_user, machine) = (
+        Some(InternetSettings {
             proxy_enabled: registry_dword("ProxyEnable") == Some(1),
             proxy_server: registry_string("ProxyServer").unwrap_or_default(),
             proxy_override: registry_string("ProxyOverride").unwrap_or_default(),
         }),
-        current_user: current_user_winhttp(),
-        machine: machine_winhttp(),
+        current_user_winhttp(),
+        machine_winhttp(),
+    );
+    #[cfg(not(windows))]
+    let (internet, current_user, machine) = (None, None, None);
+    ProxySources {
+        environment,
+        internet,
+        current_user,
+        machine,
     }
 }
 

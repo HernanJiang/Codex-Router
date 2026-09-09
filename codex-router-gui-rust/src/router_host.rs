@@ -162,6 +162,7 @@ fn default_runtime_config(
     };
     config.proxy_url = inherited_proxy_url();
     config.api_keys.push(local_key.to_owned());
+    config_compiler::apply_platform_runtime_policy(&mut config);
     config
 }
 
@@ -206,7 +207,9 @@ fn write_runtime_config(path: &Path, config: &CliProxyConfig) -> Result<()> {
 }
 
 async fn start_cli(root: &Path, config_path: &Path) -> Result<Child> {
-    let executable = root.join(r"app\cli-proxy-api.exe");
+    let executable = root
+        .join("app")
+        .join(config_compiler::cli_executable_file_name());
     if !executable.is_file() {
         bail!(
             "CR-CLI-0001: locked CLIProxyAPI executable is missing: {}",
@@ -221,13 +224,21 @@ async fn start_cli(root: &Path, config_path: &Path) -> Result<Child> {
             actual_hash
         );
     }
-    let plugin = root.join(r"app\plugins\windows\amd64\gemini-cli-v1.0.5.dll");
-    if !plugin.is_file() {
-        bail!("CR-CLI-0001: locked Gemini CLI plugin is missing");
-    }
-    let plugin_hash = sha256_file(&plugin)?;
-    if !plugin_hash.eq_ignore_ascii_case(config_compiler::GEMINI_PLUGIN_SHA256) {
-        bail!("CR-CLI-0001: Gemini CLI plugin hash mismatch");
+    // The Gemini CLI plugin ships Windows-only; the upstream darwin package
+    // bundles no plugin, so macOS skips the plugin lock.
+    #[cfg(windows)]
+    {
+        let Some(plugin_relative) = config_compiler::gemini_plugin_relative_path() else {
+            bail!("CR-CLI-0001: locked Gemini CLI plugin path is unavailable");
+        };
+        let plugin = root.join(plugin_relative);
+        if !plugin.is_file() {
+            bail!("CR-CLI-0001: locked Gemini CLI plugin is missing");
+        }
+        let plugin_hash = sha256_file(&plugin)?;
+        if !plugin_hash.eq_ignore_ascii_case(config_compiler::GEMINI_PLUGIN_SHA256) {
+            bail!("CR-CLI-0001: Gemini CLI plugin hash mismatch");
+        }
     }
     let logs = router_state_root().join("logs");
     std::fs::create_dir_all(&logs)?;
@@ -281,6 +292,7 @@ where
 /// this host, even when the host is terminated without running the ctrl-c
 /// cleanup path. Failure is reported as CR-CLI-0011 but does not block
 /// startup: port-based cleanup in the GUI lifecycle is the second net.
+#[cfg(windows)]
 fn assign_kill_on_close_job(child: &Child) -> Result<()> {
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::JobObjects::{
@@ -327,6 +339,14 @@ fn assign_kill_on_close_job(child: &Child) -> Result<()> {
         // host process exits (even via TerminateProcess) the OS closes the
         // handle and the Job Object terminates the CLI.
     }
+    Ok(())
+}
+
+/// macOS has no Job Objects. The CLI child's orphan cleanup is left to the
+/// GUI lifecycle's port-based cleanup (the documented second net), so this is
+/// a safe no-op that preserves the failure-is-non-fatal contract.
+#[cfg(not(windows))]
+fn assign_kill_on_close_job(_child: &Child) -> Result<()> {
     Ok(())
 }
 

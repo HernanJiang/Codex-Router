@@ -1,4 +1,5 @@
 use anyhow::{bail, Context};
+use codex_router_lib::backend::config_compiler as cli_compiler;
 use reqwest::blocking::{Client, Response};
 use reqwest::header::{ACCEPT, USER_AGENT};
 use serde::{Deserialize, Serialize};
@@ -292,12 +293,13 @@ pub(crate) fn spawn_apply_helper(
     let helper_root = update_cache_root().join("helpers");
     fs::create_dir_all(&helper_root).context("could not create the update helper directory")?;
     cleanup_old_helpers(&helper_root, None);
-    let helper = helper_root.join(format!(
-        "Codex-Router-Updater-{}-{}.exe",
-        parent_pid,
+    let helper = helper_root.join(cli_compiler::executable_file_name(&format!(
+        "Codex-Router-Updater-{parent_pid}-{}",
         unique_suffix()
-    ));
+    )));
     fs::copy(&current_exe, &helper).context("could not prepare the detached update helper")?;
+    // The VC++ runtime sidecar only exists in the Windows portable tree.
+    #[cfg(windows)]
     for runtime in ["VCRUNTIME140.dll", "VCRUNTIME140_1.dll", "MSVCP140.dll"] {
         let source = router_root.join(runtime);
         if source.is_file() {
@@ -1002,8 +1004,11 @@ fn verify_release_root(root: &Path, reject_unmanaged_files: bool) -> anyhow::Res
             bail!("release file SHA-256 mismatch: {}", entry.path);
         }
     }
-    if !root.join("Codex-Router.exe").is_file() {
-        bail!("the staged release does not contain Codex-Router.exe");
+    if !root.join(cli_compiler::gui_executable_file_name()).is_file() {
+        bail!(
+            "the staged release does not contain {}",
+            cli_compiler::gui_executable_file_name()
+        );
     }
     if reject_unmanaged_files {
         let mut actual = BTreeSet::new();
@@ -1236,7 +1241,7 @@ fn maximal_unmanaged_paths(
 }
 
 fn launch_updated_app(router_root: &Path) -> anyhow::Result<()> {
-    let executable = router_root.join("Codex-Router.exe");
+    let executable = router_root.join(cli_compiler::gui_executable_file_name());
     let mut child = Command::new(&executable)
         .current_dir(router_root)
         .stdin(Stdio::null())
@@ -1546,6 +1551,7 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
     #[test]
     fn verified_release_zip_extracts_into_same_volume_staging() {
         let parent = temporary_dir("archive");
@@ -1570,6 +1576,7 @@ mod tests {
         fs::remove_dir_all(parent).unwrap();
     }
 
+    #[cfg(windows)]
     #[test]
     fn native_installer_verifies_and_replaces_portable_release_without_shortcut() {
         let parent = temporary_dir("native-install");
@@ -1618,6 +1625,7 @@ mod tests {
         fs::remove_dir_all(parent).unwrap();
     }
 
+    #[cfg(windows)]
     #[test]
     fn native_installer_cleans_staging_when_existing_installation_is_invalid() {
         let parent = temporary_dir("native-install-invalid-existing");
@@ -1680,6 +1688,7 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[cfg(windows)]
     #[test]
     fn update_transaction_preserves_unmanaged_state_and_can_rollback() {
         let parent = temporary_dir("transaction");
@@ -1726,6 +1735,7 @@ mod tests {
         fs::remove_dir_all(parent).unwrap();
     }
 
+    #[cfg(windows)]
     #[test]
     fn update_transaction_commit_keeps_state_and_removes_old_release() {
         let parent = temporary_dir("commit");

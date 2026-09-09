@@ -12,6 +12,8 @@ Codex-Router combines original project material with independent third-party sof
 - License text: `licenses/CLIProxyAPI-LICENSE.txt`
 - Bundled Windows amd64 asset SHA-256: `80eef3e63e229405362c0f302abba50909cd53f10f6036c438d3f4f765144d34`
 - Bundled executable SHA-256: `0a8ffc52dfb2a466baa1b006341b350bdb1f76fc70b6cc80375bb99afdff697b`
+- macOS arm64 asset (`CLIProxyAPI_7.2.135_darwin_aarch64.tar.gz`) SHA-256: `c5f6e785cf7568c177d5c31aa75c389c4bb1b1dee9e0133887b9bce3200475dd` (matches upstream `checksums.txt`)
+- macOS arm64 executable (`cli-proxy-api`, Mach-O arm64, no plugin bundled) SHA-256: `5f24ebf3ed2caeee6ff63b5eaba7ccdb66f3ccb7af273ba1f70d68dc2f3531fb`
 
 The bundled `app/cli-proxy-api.exe` is the audited `v7.2.135` Windows amd64 build. The 2.0.0 release builder verifies the executable and the archive hashes above before staging and fails closed on any mismatch. Recipients may exercise the rights granted by CLIProxyAPI's upstream MIT license with respect to CLIProxyAPI itself. Restrictions in Codex-Router's license apply to original Codex-Router material and the Codex-Router combination/distribution, not to independently obtained upstream CLIProxyAPI code.
 

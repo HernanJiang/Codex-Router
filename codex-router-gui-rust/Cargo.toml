@@ -3,7 +3,7 @@ name = "codex-router"
 version = "3.2.9"
 edition = "2021"
 
-[target.'cfg(windows)'.dependencies]
+[dependencies]
 eframe = { version = "0.35", default-features = false, features = ["default_fonts", "glow", "persistence"] }
 egui = "0.35"
 image = { version = "0.25", default-features = false, features = ["ico", "png"] }
@@ -15,23 +15,16 @@ arboard = "3.6"
 chrono = "0.4"
 cron = "0.15"
 dirs = "5.0"
+libc = "0.2"
 rfd = "0.15"
 regex = "1.11"
 url = "2.5"
 sha2 = "0.10"
 hmac = "0.12"
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 toml_edit = "0.22"
 zeroize = "1.8"
 zstd = "0.13"
 zip = { version = "4.6", default-features = false, features = ["deflate"] }
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinHttp", "Win32_Networking_WinSock", "Win32_Security_Credentials", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Diagnostics_ToolHelp", "Win32_System_JobObjects", "Win32_System_Registry", "Win32_System_Threading", "Win32_UI_HiDpi", "Win32_UI_WindowsAndMessaging"] }
-windows = { version = "0.61", features = ["Win32_System_Com", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
-
-[target.'cfg(windows)'.build-dependencies]
-windres = "0.2"
-
-[dependencies]
 axum = { version = "0.8", features = ["ws"] }
 hyper = "1"
 hyper-util = { version = "0.1", features = ["tokio"] }
@@ -44,6 +37,13 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "sy
 tokio-util = { version = "0.7", features = ["compat"] }
 tower-http = { version = "0.6", features = ["trace", "cors"] }
 uuid = { version = "1", features = ["v7", "serde"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinHttp", "Win32_Networking_WinSock", "Win32_Security_Credentials", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Diagnostics_ToolHelp", "Win32_System_JobObjects", "Win32_System_Registry", "Win32_System_Threading", "Win32_UI_HiDpi", "Win32_UI_WindowsAndMessaging"] }
+windows = { version = "0.61", features = ["Win32_System_Com", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+
+[target.'cfg(windows)'.build-dependencies]
+windres = "0.2"
 
 [lib]
 # The lib must not share a crate name with the `codex-router` bin (whose crate

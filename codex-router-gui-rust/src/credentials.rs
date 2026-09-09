@@ -1,15 +1,21 @@
-//! Minimal Windows Credential Manager access for headless Router Host.
+//! Credential access for headless Router Host.
+//! Windows uses the Credential Manager, macOS uses the Keychain via the
+//! system `security` CLI. Both expose the same read/write/delete surface.
 
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
-use std::ptr::null_mut;
 use std::sync::OnceLock;
+use zeroize::Zeroizing;
+
+#[cfg(windows)]
+use std::ptr::null_mut;
+#[cfg(windows)]
 use windows_sys::Win32::Foundation::ERROR_NOT_FOUND;
+#[cfg(windows)]
 use windows_sys::Win32::Security::Credentials::{
     CredDeleteW, CredFree, CredReadW, CredWriteW, CREDENTIALW, CRED_PERSIST_LOCAL_MACHINE,
     CRED_TYPE_GENERIC,
 };
-use zeroize::Zeroizing;
 
 /// UserData-scoped prefix so CodexRouter keys do not collide with CraftStation
 /// or another Router copy that uses a different state root. Empty = legacy
@@ -69,6 +75,7 @@ pub fn legacy_wincred_target(name: &str) -> String {
     format!("CodexRouter/{name}")
 }
 
+#[cfg(windows)]
 fn wide(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(std::iter::once(0)).collect()
 }
@@ -103,6 +110,7 @@ pub fn read_text(name: &str) -> Result<Option<Zeroizing<String>>> {
     Ok(None)
 }
 
+#[cfg(windows)]
 fn read_target(target_name: &str) -> Result<Option<Zeroizing<String>>> {
     let target = wide(target_name);
     let mut credential: *mut CREDENTIALW = null_mut();
@@ -139,14 +147,35 @@ fn read_target(target_name: &str) -> Result<Option<Zeroizing<String>>> {
     ))
 }
 
+#[cfg(target_os = "macos")]
+fn read_target(target_name: &str) -> Result<Option<Zeroizing<String>>> {
+    let output = std::process::Command::new("security")
+        .args(["find-generic-password", "-s", target_name, "-w"])
+        .output()
+        .context("could not query the macOS Keychain")?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let secret = String::from_utf8(output.stdout)
+        .context("Keychain returned non-UTF-8 data")?
+        .trim_end_matches('\n')
+        .to_owned();
+    Ok(Some(Zeroizing::new(secret)))
+}
+
 pub fn write_text(name: &str, secret: &str) -> Result<()> {
     if environment_override(name).is_some_and(|variable| std::env::var_os(variable).is_some()) {
         bail!("environment-overridden credential is read-only");
     }
     if name.trim().is_empty() || name.contains('\0') {
-        bail!("Windows credential name is invalid");
+        bail!("credential name is invalid");
     }
-    let mut target = wide(&wincred_target(name));
+    write_target(&wincred_target(name), secret)
+}
+
+#[cfg(windows)]
+fn write_target(target_name: &str, secret: &str) -> Result<()> {
+    let mut target = wide(target_name);
     let mut username = wide(&std::env::var("USERNAME").unwrap_or_default());
     let mut secret: Vec<u16> = secret.encode_utf16().collect();
     let blob_size = u32::try_from(secret.len().saturating_mul(std::mem::size_of::<u16>()))
@@ -172,6 +201,30 @@ pub fn write_text(name: &str, secret: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
+fn write_target(target_name: &str, secret: &str) -> Result<()> {
+    let mut child = std::process::Command::new("security")
+        .args([
+            "add-generic-password",
+            "-s",
+            target_name,
+            "-a",
+            "CodexRouter",
+            "-w",
+            secret,
+            "-U",
+        ])
+        .spawn()
+        .context("could not spawn the macOS Keychain write")?;
+    let status = child
+        .wait()
+        .context("could not await the macOS Keychain write")?;
+    if !status.success() {
+        bail!("macOS Keychain write failed with {status}");
+    }
+    Ok(())
+}
+
 pub fn delete_text(name: &str) -> Result<()> {
     delete_target(&wincred_target(name))?;
     if CREDENTIAL_SCOPE
@@ -183,6 +236,7 @@ pub fn delete_text(name: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(windows)]
 fn delete_target(target_name: &str) -> Result<()> {
     let target = wide(target_name);
     let deleted = unsafe { CredDeleteW(target.as_ptr(), CRED_TYPE_GENERIC, 0) } != 0;
@@ -193,6 +247,18 @@ fn delete_target(target_name: &str) -> Result<()> {
         }
         return Err(error).context("Windows Credential Manager delete failed");
     }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn delete_target(target_name: &str) -> Result<()> {
+    let status = std::process::Command::new("security")
+        .args(["delete-generic-password", "-s", target_name])
+        .status()
+        .context("could not spawn the macOS Keychain delete")?;
+    // Keychain reports a non-zero status when the item is absent; that is a
+    // successful no-op for our callers.
+    let _ = status;
     Ok(())
 }
 

@@ -21,13 +21,13 @@ use profiles::{IsolationKind, IsolationProfile};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
-#[cfg(test)]
+#[cfg(all(test, windows))]
 use std::io::{Seek, SeekFrom};
 use std::net::{IpAddr, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-#[cfg(test)]
+#[cfg(all(test, windows))]
 use std::os::windows::process::CommandExt;
-#[cfg(test)]
+#[cfg(all(test, windows))]
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -54,7 +54,7 @@ const CURRENT_TERMS_VERSION: &str = "codex-router-terms-v1.3.0-2026-08-18";
 const OFFICIAL_GITHUB_URL: &str = "https://github.com/HernanJiang/CodexRouter";
 const MAX_LOG_BYTES: usize = 256 * 1024;
 const RETAIN_LOG_BYTES: usize = 192 * 1024;
-#[cfg(test)]
+#[cfg(all(test, windows))]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 const HEALTHY_PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 const FAILED_PROBE_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
@@ -68,9 +68,9 @@ const HEALTH_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 const API_MODEL_VALIDATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 const EXIT_CONFIG_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const EXIT_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
-#[cfg(test)]
+#[cfg(all(test, windows))]
 const EXIT_PROCESS_KILL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
-#[cfg(test)]
+#[cfg(all(test, windows))]
 const EXIT_HELPER_OUTPUT_LIMIT: usize = 64 * 1024;
 const BACKGROUND_USAGE_REFRESH_INTERVAL: std::time::Duration = BACKGROUND_SELF_CHECK_INTERVAL;
 // Logical points, not physical pixels. Startup is fitted to the primary
@@ -205,6 +205,11 @@ fn primary_work_area_logical_size() -> Option<[f32; 2]> {
         width as f32 * points_per_pixel,
         height as f32 * points_per_pixel,
     ])
+}
+
+#[cfg(not(windows))]
+fn primary_work_area_logical_size() -> Option<[f32; 2]> {
+    None
 }
 
 fn stored_window_size(width: f32, height: f32) -> Option<[f32; 2]> {
@@ -1786,7 +1791,7 @@ struct CodexRouterApp {
     update_info: Option<GitHubUpdateInfo>,
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 fn wait_for_child_exit(child: &mut std::process::Child, timeout: std::time::Duration) -> bool {
     let started = std::time::Instant::now();
     loop {
@@ -1800,7 +1805,7 @@ fn wait_for_child_exit(child: &mut std::process::Child, timeout: std::time::Dura
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 fn terminate_child_process_tree(child: &mut std::process::Child) {
     let taskkill = std::env::var_os("SystemRoot")
         .map(PathBuf::from)
@@ -2016,6 +2021,9 @@ fn hide_current_process_windows() {
         EnumWindows(Some(hide_owned_window), GetCurrentProcessId() as LPARAM);
     }
 }
+
+#[cfg(not(windows))]
+fn hide_current_process_windows() {}
 
 fn decode_icon() -> anyhow::Result<(Vec<u8>, u32, u32)> {
     let image =
@@ -2601,7 +2609,7 @@ fn localized_error_summary(zh: bool, text: &str) -> String {
     summary
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 fn oauth_prepare_error_from_output(output: &std::process::Output) -> String {
     for raw in [&output.stdout, &output.stderr] {
         let text = String::from_utf8_lossy(raw);
@@ -3092,6 +3100,7 @@ fn append_bounded_log(logs: &mut String, message: &str) {
     *logs = retained;
 }
 
+#[cfg(windows)]
 #[allow(dead_code)]
 fn read_windows_credential(target: &str) -> Result<String, String> {
     use windows_sys::Win32::Security::Credentials::{
@@ -3266,23 +3275,58 @@ fn router_health_failure_recoverable(error: &str) -> bool {
         || normalized.contains("http/1.0 403"))
 }
 
+/// Returns the platform font directory, the Latin font specs, and the CJK
+/// candidate file names. Windows reads the per-user/machine Fonts dir;
+/// macOS reads `/System/Library/Fonts` (Hiragino Sans GB / STHeiti provide
+/// Simplified-Chinese glyph coverage in place of Microsoft YaHei).
+fn platform_font_sources() -> (PathBuf, Vec<(&'static str, &'static str)>, Vec<&'static str>) {
+    #[cfg(windows)]
+    {
+        let font_dir = std::env::var_os("WINDIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\Windows"))
+            .join("Fonts");
+        let specs = vec![
+            ("segoe", "segoeui.ttf"),
+            ("segoe-symbol", "seguisym.ttf"),
+            ("arial-black", "ariblk.ttf"),
+            ("georgia-italic", "georgiai.ttf"),
+            ("consolas", "consola.ttf"),
+        ];
+        let cjk = vec!["msyh.ttc", "msyh.ttf", "msyhbd.ttc", "simsun.ttc", "simhei.ttf", "Deng.ttf"];
+        (font_dir, specs, cjk)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let font_dir = PathBuf::from("/System/Library/Fonts");
+        let specs = vec![
+            // Latin UI fonts with macOS system counterparts.
+            ("segoe", "Helvetica.ttc"),
+            ("arial-black", "HelveticaNeue.ttc"),
+            ("georgia-italic", "NewYorkItalic.ttf"),
+            ("consolas", "Menlo.ttc"),
+        ];
+        let cjk = vec![
+            "Hiragino Sans GB.ttc",
+            "STHeiti Light.ttc",
+            "STHeiti Medium.ttc",
+        ];
+        (font_dir, specs, cjk)
+    }
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    {
+        // Non-Windows/non-macOS: no bundled fonts, rely on egui defaults only.
+        (PathBuf::new(), Vec::new(), Vec::new())
+    }
+}
+
 /// Installs the full font set. Returns false when no CJK font could be read
 /// so callers keep retrying instead of freezing the UI in tofu boxes.
 fn install_app_fonts(ctx: &egui::Context) -> bool {
     let mut fonts = egui::FontDefinitions::default();
-    let windows_fonts = std::env::var_os("WINDIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"))
-        .join("Fonts");
-    let font_specs = [
-        ("segoe", "segoeui.ttf"),
-        ("segoe-symbol", "seguisym.ttf"),
-        ("arial-black", "ariblk.ttf"),
-        ("georgia-italic", "georgiai.ttf"),
-        ("consolas", "consola.ttf"),
-    ];
+    let (font_dir, font_specs, cjk_candidates) = platform_font_sources();
     for (name, file_name) in font_specs {
-        if let Ok(data) = std::fs::read(windows_fonts.join(file_name)) {
+        if let Ok(data) = std::fs::read(font_dir.join(file_name)) {
             fonts
                 .font_data
                 .insert(name.into(), egui::FontData::from_owned(data).into());
@@ -3292,11 +3336,12 @@ fn install_app_fonts(ctx: &egui::Context) -> bool {
     // transient read failure (file lock, pending Windows update) must not
     // mark the full font set as installed, so try several CJK candidates and
     // report whether any of them landed.
-    for file_name in ["msyh.ttc", "msyh.ttf", "msyhbd.ttc", "simsun.ttc", "simhei.ttf", "Deng.ttf"] {
-        if let Ok(data) = std::fs::read(windows_fonts.join(file_name)) {
+    let mut cjk_name = "msyh";
+    for file_name in cjk_candidates {
+        if let Ok(data) = std::fs::read(font_dir.join(file_name)) {
             fonts
                 .font_data
-                .insert("msyh".into(), egui::FontData::from_owned(data).into());
+                .insert(cjk_name.into(), egui::FontData::from_owned(data).into());
             break;
         }
     }
@@ -8470,18 +8515,17 @@ impl CodexRouterApp {
                 }
             }
         });
-        let valid = self
-            .router_root
-            .join("app")
-            .join("codex-router-host.exe")
-            .exists()
-            && self.router_root.join("app").join("cli-proxy-api.exe").exists();
+        let valid = config::RouterConfig::is_router_root(&self.router_root);
         if valid {
             ui.colored_label(egui::Color32::from_rgb(22, 163, 74), "已识别完整运行环境");
         } else {
             ui.colored_label(
                 egui::Color32::from_rgb(220, 38, 38),
-                "目录中缺少 app/codex-router-host.exe 或 app/cli-proxy-api.exe",
+                format!(
+                    "目录中缺少 app/{} 或 app/{}",
+                    codex_router_lib::backend::config_compiler::host_executable_file_name(),
+                    codex_router_lib::backend::config_compiler::cli_executable_file_name(),
+                ),
             );
         }
         ui.add_space(20.0);
@@ -8890,7 +8934,7 @@ fn window_icon() -> egui::IconData {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 fn run_hidden_powershell_output(
     router_root: &Path,
     script_name: &str,
@@ -9812,6 +9856,9 @@ fn main() -> eframe::Result<()> {
 mod main_tests {
     use std::io::{Read, Write};
 
+    #[cfg(windows)]
+    use super::{oauth_prepare_error_from_output, run_hidden_powershell_output};
+
     use super::{
         advance_overwrite_countdown, append_bounded_log, auto_enable_first_oauth_model,
         auto_import_new_oauth_models, classify_router_health_error,
@@ -9822,12 +9869,12 @@ mod main_tests {
         initial_page_for_config, initial_window_logical_size, localized_deployment_line,
         localized_error_summary, next_background_usage_refresh, next_failed_oauth_recovery,
         next_request_generation, normalize_usage_account_messages, oauth_account_refresh_can_start,
-        oauth_prepare_error_from_native, oauth_prepare_error_from_output, oauth_prepare_error_is_retryable,
+        oauth_prepare_error_from_native, oauth_prepare_error_is_retryable,
         oauth_recovery_schedule_delay, profile_binding_ready, request_result_disposition,
         restore_apply_ui_fields,         restore_codex_and_stop_router_for_exit_with,
         restore_codex_for_exit, restored_window_size, retain_last_good_oauth_models,
         recover_single_profile_binding, router_mode_enabled_on_startup, runtime_probes_allowed,
-        run_hidden_powershell_output, should_leave_tray_lightweight, stored_window_size,
+        should_leave_tray_lightweight, stored_window_size,
         scheduled_oauth_recovery_can_start, scheduled_usage_refresh_is_due,
         window_size_is_usable,
         usage_error_for_display, user_data, AdminTaskActivity, ApplyUiRollback, IsolationKind,
@@ -11604,6 +11651,7 @@ mod main_tests {
         );
     }
 
+    #[cfg(windows)]
     #[test]
     fn hidden_helper_completion_does_not_wait_for_inherited_service_handles() {
         let root = std::env::temp_dir().join(format!(
@@ -11695,6 +11743,7 @@ mod main_tests {
         assert!(localized_error_summary(true, &mapped).contains("未能稳定启动"));
     }
 
+    #[cfg(windows)]
     #[test]
     fn oauth_prepare_errors_keep_only_safe_structured_stage_codes() {
         use std::os::windows::process::ExitStatusExt;
@@ -11712,6 +11761,7 @@ mod main_tests {
         assert!(localized_error_summary(false, &safe).contains("admin session"));
     }
 
+    #[cfg(windows)]
     #[test]
     fn oauth_prepare_errors_are_found_in_stderr_when_stdout_contains_noise() {
         use std::os::windows::process::ExitStatusExt;

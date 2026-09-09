@@ -2,30 +2,33 @@ use crate::config::{atomic_write, ModelConfig, ReasoningConfig, RouterConfig};
 use anyhow::{bail, Context};
 use sha2::Digest;
 use serde_json::{json, Value};
-#[cfg(test)]
+#[cfg(all(test, windows))]
 use std::collections::VecDeque;
 use std::collections::{HashMap, HashSet};
-#[cfg(test)]
+#[cfg(all(test, windows))]
 use std::io::{BufRead, BufReader};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
-#[cfg(test)]
+#[cfg(all(test, windows))]
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
-#[cfg(test)]
+#[cfg(all(test, windows))]
 use std::process::{Command, Stdio};
 use std::sync::atomic::AtomicBool;
-#[cfg(test)]
+#[cfg(all(test, windows))]
 use std::sync::atomic::Ordering;
-#[cfg(test)]
+#[cfg(all(test, windows))]
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use toml_edit::{DocumentMut, Item};
+#[cfg(windows)]
 use windows_sys::Win32::Foundation::LocalFree;
+#[cfg(windows)]
 use windows_sys::Win32::Security::Credentials::{
     CredDeleteW, CredFree, CredReadW, CredWriteW, CREDENTIALW, CRED_PERSIST_LOCAL_MACHINE,
     CRED_TYPE_GENERIC,
 };
+#[cfg(windows)]
 use windows_sys::Win32::Security::Cryptography::{
     BCryptGenRandom, CryptProtectData, CryptUnprotectData, CRYPTPROTECT_UI_FORBIDDEN,
     CRYPT_INTEGER_BLOB,
@@ -2400,12 +2403,26 @@ fn read_router_credential(name: &str) -> anyhow::Result<Option<SecretWide>> {
         return Ok(Some(SecretWide(value.encode_utf16().collect())));
     }
 
-    if let Some(secret) = read_router_credential_target(&router_credential_target(name))? {
-        return Ok(Some(secret));
+    #[cfg(windows)]
+    {
+        if let Some(secret) = read_router_credential_target(&router_credential_target(name))? {
+            return Ok(Some(secret));
+        }
+        return read_router_credential_target(&router_legacy_credential_target(name));
     }
-    read_router_credential_target(&router_legacy_credential_target(name))
+
+    // Non-Windows: the desktop Credential Manager does not exist. Route
+    // through `crate::credentials` (macOS Keychain via the `security` CLI),
+    // which already mirrors the scoped/legacy target selection and the
+    // environment overrides checked above.
+    #[cfg(not(windows))]
+    {
+        return Ok(crate::credentials::read_text(name)?
+            .map(|secret| SecretWide(secret.as_str().encode_utf16().collect())));
+    }
 }
 
+#[cfg(windows)]
 fn read_router_credential_target(target: &[u16]) -> anyhow::Result<Option<SecretWide>> {
     const ERROR_NOT_FOUND: i32 = 1168;
     let mut credential: *mut CREDENTIALW = std::ptr::null_mut();
@@ -2443,6 +2460,7 @@ fn read_router_credential_target(target: &[u16]) -> anyhow::Result<Option<Secret
     result.map(Some)
 }
 
+#[cfg(windows)]
 fn write_router_credential(name: &str, secret: &[u16]) -> anyhow::Result<()> {
     if router_credential_environment(name)
         .is_some_and(|variable| std::env::var_os(variable).is_some())
@@ -2546,6 +2564,7 @@ pub(crate) fn write_router_credential_text(name: &str, secret: &str) -> anyhow::
     result
 }
 
+#[cfg(windows)]
 fn delete_router_credential(name: &str) -> anyhow::Result<()> {
     const ERROR_NOT_FOUND: i32 = 1168;
 
@@ -2557,6 +2576,17 @@ fn delete_router_credential(name: &str) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(not(windows))]
+fn write_router_credential(name: &str, secret: &[u16]) -> anyhow::Result<()> {
+    let secret = String::from_utf16(secret).context("credential contains invalid UTF-16")?;
+    crate::credentials::write_text(name, &secret)
+}
+
+#[cfg(not(windows))]
+fn delete_router_credential(name: &str) -> anyhow::Result<()> {
+    crate::credentials::delete_text(name)
 }
 
 pub(crate) fn remove_isolated_profile_credentials(names: &[String]) -> anyhow::Result<()> {
@@ -2575,6 +2605,7 @@ pub(crate) fn remove_isolated_profile_credentials(names: &[String]) -> anyhow::R
     }
 }
 
+#[cfg(windows)]
 fn secure_random_bytes(buf: &mut [u8]) -> anyhow::Result<()> {
     const BCRYPT_USE_SYSTEM_PREFERRED_RNG: u32 = 0x00000002;
     if unsafe {
@@ -2588,6 +2619,15 @@ fn secure_random_bytes(buf: &mut [u8]) -> anyhow::Result<()> {
     {
         bail!("BCryptGenRandom failed");
     }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn secure_random_bytes(buf: &mut [u8]) -> anyhow::Result<()> {
+    use std::io::Read as _;
+    // Mac/Unix：从系统 CSPRNG /dev/urandom 读取加密安全随机字节，等价于 BCryptGenRandom。
+    let mut file = std::fs::File::open("/dev/urandom").context("打开 /dev/urandom 失败")?;
+    file.read_exact(buf).context("读取 /dev/urandom 失败")?;
     Ok(())
 }
 
@@ -2817,13 +2857,28 @@ pub fn unprotect_file_for_current_user(source: &Path, destination: &Path) -> any
 }
 
 fn crypt_protect_for_current_user(data: &[u8]) -> anyhow::Result<Vec<u8>> {
-    crypt_dpapi(data, true)
+    #[cfg(windows)]
+    return crypt_dpapi(data, true);
+    #[cfg(not(windows))]
+    {
+        let _ = data;
+        // Mac 首版：DPAPI 不存在，加密降级为原样返回（文件不加密，仅透传字节）。
+        Ok(data.to_vec())
+    }
 }
 
 fn crypt_unprotect_for_current_user(data: &[u8]) -> anyhow::Result<Vec<u8>> {
-    crypt_dpapi(data, false)
+    #[cfg(windows)]
+    return crypt_dpapi(data, false);
+    #[cfg(not(windows))]
+    {
+        let _ = data;
+        // Mac 首版：DPAPI 不存在，解密降级为原样返回（透传字节）。
+        Ok(data.to_vec())
+    }
 }
 
+#[cfg(windows)]
 fn crypt_dpapi(data: &[u8], protect: bool) -> anyhow::Result<Vec<u8>> {
     let data_len = u32::try_from(data.len()).context("DPAPI 输入文件过大")?;
     let input = CRYPT_INTEGER_BLOB {
@@ -2875,7 +2930,7 @@ fn crypt_dpapi(data: &[u8], protect: bool) -> anyhow::Result<Vec<u8>> {
     Ok(result)
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 fn terminate_deployment_process_tree(child: &mut std::process::Child) {
     let taskkill = std::env::var_os("SystemRoot")
         .map(PathBuf::from)
@@ -2895,7 +2950,7 @@ fn terminate_deployment_process_tree(child: &mut std::process::Child) {
     let _ = child.wait();
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 pub fn run_apply_script<F>(router_root: &Path, on_line: F) -> anyhow::Result<()>
 where
     F: FnMut(String),
@@ -2904,7 +2959,7 @@ where
     run_apply_script_with_cancel(router_root, &cancel, None, on_line)
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 pub fn run_apply_script_with_cancel<F>(
     router_root: &Path,
     cancel: &AtomicBool,
@@ -6179,6 +6234,7 @@ base_url = "https://api.430123.xyz/v1"
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    #[cfg(windows)]
     #[test]
     fn packaged_layout_keeps_the_deployment_config_out_of_the_release_folder() {
         // A packaged release must never treat the extracted folder as the config
@@ -6196,6 +6252,7 @@ base_url = "https://api.430123.xyz/v1"
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    #[cfg(windows)]
     #[test]
     fn deployment_failure_summarizes_stdout_when_stderr_is_empty() {
         let root = temporary_test_dir("apply-stdout-error");
@@ -6218,6 +6275,7 @@ base_url = "https://api.430123.xyz/v1"
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    #[cfg(windows)]
     #[test]
     fn deployment_failure_keeps_the_stable_marker_for_the_user_facing_message() {
         let root = temporary_test_dir("apply-marker-error");
@@ -6245,6 +6303,7 @@ base_url = "https://api.430123.xyz/v1"
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    #[cfg(windows)]
     #[test]
     fn deployment_completion_does_not_wait_for_inherited_service_pipes() {
         let root = temporary_test_dir("apply-inherited-pipe");

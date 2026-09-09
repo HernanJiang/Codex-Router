@@ -657,6 +657,7 @@ async fn sync_backend_ex(state: &ControlState, publish: CliPublish) -> Result<us
         .ok()
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty());
+    config_compiler::apply_platform_runtime_policy(&mut config);
     let yaml = config_compiler::to_yaml(&config)?;
     if publish_cli {
         // Push through the management API: the CLI validates the document,

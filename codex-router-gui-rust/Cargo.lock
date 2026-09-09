@@ -638,6 +638,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "image",
+ "libc",
  "regex",
  "reqwest",
  "rfd",

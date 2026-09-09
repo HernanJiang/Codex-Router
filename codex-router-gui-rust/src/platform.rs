@@ -1,30 +1,45 @@
 use anyhow::{bail, Context};
+#[cfg(windows)]
 use std::collections::{HashMap, HashSet};
+#[cfg(windows)]
 use std::path::{Path, PathBuf};
 use std::process::Command;
+#[cfg(windows)]
 use std::time::{Duration, Instant};
+#[cfg(windows)]
 use windows::core::HSTRING;
+#[cfg(windows)]
 use windows::Win32::UI::Shell::ShellExecuteW;
+#[cfg(windows)]
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+#[cfg(windows)]
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_INVALID_PARAMETER, HWND, INVALID_HANDLE_VALUE, LPARAM, WAIT_OBJECT_0,
 };
+#[cfg(windows)]
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
 };
+#[cfg(windows)]
 use windows_sys::Win32::System::Threading::{
     OpenProcess, QueryFullProcessImageNameW, TerminateProcess, WaitForSingleObject,
     PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
 };
+#[cfg(windows)]
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetWindowThreadProcessId, PostMessageW, WM_CLOSE,
 };
 use zeroize::Zeroizing;
 
+#[cfg(windows)]
 const CHATGPT_EXECUTABLE: &str = "ChatGPT.exe";
+#[cfg(windows)]
 const CODEX_PACKAGE_PREFIX: &str = "OpenAI.Codex_";
+#[cfg(windows)]
 const CODEX_APP_USER_MODEL_ID: &str = "OpenAI.Codex_2p2nqsd0c76g0!App";
+#[cfg(windows)]
 const GRACEFUL_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(windows)]
 const RELAUNCH_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -34,6 +49,7 @@ pub enum CodexRestartOutcome {
     RelaunchSkipped,
 }
 
+#[cfg(windows)]
 #[derive(Clone, Debug)]
 struct DesktopProcess {
     process_id: u32,
@@ -41,12 +57,14 @@ struct DesktopProcess {
     executable: Option<PathBuf>,
 }
 
+#[cfg(windows)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum RestartTarget {
     PackagedApp { app_user_model_id: String },
     Executable(PathBuf),
 }
 
+#[cfg(windows)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ProcessOpenDisposition {
     AlreadyExited,
@@ -66,10 +84,28 @@ pub(crate) fn external_https_url(requested_url: &str) -> anyhow::Result<String> 
 }
 
 pub(crate) fn open_external_https_url(requested_url: &str) -> anyhow::Result<()> {
-    let url = HSTRING::from(external_https_url(requested_url)?);
+    let url = external_https_url(requested_url)?;
+    open_validated_url(&url)
+}
+
+#[cfg(windows)]
+fn open_validated_url(url: &str) -> anyhow::Result<()> {
+    let url = HSTRING::from(url);
     let operation = HSTRING::from("open");
     let result = unsafe { ShellExecuteW(None, &operation, &url, None, None, SW_SHOWNORMAL) };
     if result.0 as isize <= 32 {
+        bail!("class=process_failure")
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn open_validated_url(url: &str) -> anyhow::Result<()> {
+    let status = Command::new("open")
+        .arg(url)
+        .status()
+        .context("could not open url in the default browser")?;
+    if !status.success() {
         bail!("class=process_failure")
     }
     Ok(())
@@ -86,6 +122,7 @@ pub fn copy_router_credential(name: &str, prefix: Option<&str>) -> anyhow::Resul
         .context("could not write to the system clipboard")
 }
 
+#[cfg(windows)]
 pub fn restart_codex_desktop() -> anyhow::Result<CodexRestartOutcome> {
     let processes = codex_desktop_processes()?;
     if processes.is_empty() {
@@ -124,10 +161,22 @@ pub fn restart_codex_desktop() -> anyhow::Result<CodexRestartOutcome> {
     bail!("Codex / ChatGPT desktop did not start within 10 seconds")
 }
 
+#[cfg(not(windows))]
+pub fn restart_codex_desktop() -> anyhow::Result<CodexRestartOutcome> {
+    Ok(CodexRestartOutcome::NotRunning)
+}
+
+#[cfg(windows)]
 pub fn codex_desktop_running() -> bool {
     codex_desktop_processes().is_ok_and(|processes| !processes.is_empty())
 }
 
+#[cfg(not(windows))]
+pub fn codex_desktop_running() -> bool {
+    false
+}
+
+#[cfg(windows)]
 fn codex_desktop_processes() -> anyhow::Result<Vec<DesktopProcess>> {
     let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
     if snapshot == INVALID_HANDLE_VALUE {
@@ -154,6 +203,7 @@ fn codex_desktop_processes() -> anyhow::Result<Vec<DesktopProcess>> {
     Ok(processes)
 }
 
+#[cfg(windows)]
 fn process_path(process_id: u32) -> anyhow::Result<PathBuf> {
     let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, process_id) };
     if handle.is_null() {
@@ -170,6 +220,7 @@ fn process_path(process_id: u32) -> anyhow::Result<PathBuf> {
     Ok(PathBuf::from(String::from_utf16_lossy(&path)))
 }
 
+#[cfg(windows)]
 fn terminate_codex_desktop(process: &DesktopProcess) -> anyhow::Result<()> {
     let Some(expected_path) = process.executable.as_deref() else {
         bail!("refusing to terminate an unverified Codex / ChatGPT process")
@@ -220,6 +271,7 @@ fn terminate_codex_desktop(process: &DesktopProcess) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(windows)]
 fn classify_open_process_error(error: std::io::Error) -> ProcessOpenDisposition {
     if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32) {
         ProcessOpenDisposition::AlreadyExited
@@ -228,6 +280,7 @@ fn classify_open_process_error(error: std::io::Error) -> ProcessOpenDisposition 
     }
 }
 
+#[cfg(windows)]
 fn process_has_exited(process_id: u32) -> bool {
     let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, process_id) };
     if handle.is_null() {
@@ -239,16 +292,19 @@ fn process_has_exited(process_id: u32) -> bool {
     exited
 }
 
+#[cfg(windows)]
 fn all_processes_exited(processes: &[DesktopProcess]) -> bool {
     processes
         .iter()
         .all(|process| process_has_exited(process.process_id))
 }
 
+#[cfg(windows)]
 struct CloseWindowContext<'a> {
     process_ids: &'a HashSet<u32>,
 }
 
+#[cfg(windows)]
 unsafe extern "system" fn close_codex_window(window: HWND, parameter: LPARAM) -> i32 {
     let context = &*(parameter as *const CloseWindowContext<'_>);
     let mut process_id = 0_u32;
@@ -259,6 +315,7 @@ unsafe extern "system" fn close_codex_window(window: HWND, parameter: LPARAM) ->
     1
 }
 
+#[cfg(windows)]
 fn request_graceful_close(processes: &[DesktopProcess]) -> anyhow::Result<()> {
     let process_ids = processes
         .iter()
@@ -280,6 +337,7 @@ fn request_graceful_close(processes: &[DesktopProcess]) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(windows)]
 fn shutdown_process_ids(processes: &[DesktopProcess]) -> Vec<u32> {
     let parents = processes
         .iter()
@@ -311,6 +369,7 @@ fn shutdown_process_ids(processes: &[DesktopProcess]) -> Vec<u32> {
         .collect()
 }
 
+#[cfg(windows)]
 fn restart_target_for_path(path: &Path) -> Option<RestartTarget> {
     if !is_codex_desktop_path(path) {
         return None;
@@ -332,6 +391,7 @@ fn restart_target_for_path(path: &Path) -> Option<RestartTarget> {
     }
 }
 
+#[cfg(windows)]
 fn launch_restart_target(target: &RestartTarget) -> anyhow::Result<()> {
     match target {
         RestartTarget::PackagedApp { app_user_model_id } => {
@@ -349,6 +409,7 @@ fn launch_restart_target(target: &RestartTarget) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(windows)]
 fn process_path_from_handle(
     handle: windows_sys::Win32::Foundation::HANDLE,
 ) -> anyhow::Result<PathBuf> {
@@ -362,22 +423,26 @@ fn process_path_from_handle(
     Ok(PathBuf::from(String::from_utf16_lossy(&path)))
 }
 
+#[cfg(windows)]
 fn paths_equal(left: &Path, right: &Path) -> bool {
     left.to_string_lossy()
         .trim_start_matches(r"\\?\")
         .eq_ignore_ascii_case(right.to_string_lossy().trim_start_matches(r"\\?\"))
 }
 
+#[cfg(windows)]
 fn is_codex_desktop_path(path: &Path) -> bool {
     path.file_name()
         .and_then(|name| name.to_str())
         .is_some_and(is_codex_desktop_executable)
 }
 
+#[cfg(windows)]
 fn is_codex_desktop_executable(name: &str) -> bool {
     name.eq_ignore_ascii_case(CHATGPT_EXECUTABLE)
 }
 
+#[cfg(windows)]
 fn utf16_c_string(value: &[u16]) -> String {
     let end = value
         .iter()
@@ -386,7 +451,7 @@ fn utf16_c_string(value: &[u16]) -> String {
     String::from_utf16_lossy(&value[..end])
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 mod tests {
     use super::*;
 

@@ -364,6 +364,7 @@ mod tests {
 
     use serde_json::Value;
 
+    #[cfg(windows)]
     #[test]
     fn successful_cutover_commits_and_is_idempotent() {
         let (root, manifest, marker, _) = fixture("never");
@@ -376,6 +377,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(marker).unwrap(), before);
     }
 
+    #[cfg(windows)]
     #[test]
     fn post_cutover_failure_restores_snapshot_and_old_health() {
         let (root, manifest, marker, state) = fixture("post_smoke");
@@ -391,6 +393,7 @@ mod tests {
         assert_eq!(load_journal(&root).unwrap().unwrap().stage, CutoverStage::RollbackHealthy);
     }
 
+    #[cfg(windows)]
     #[test]
     fn interrupted_dangerous_stage_rolls_back_before_retry() {
         let (root, manifest, marker, _) = fixture("pre_smoke");

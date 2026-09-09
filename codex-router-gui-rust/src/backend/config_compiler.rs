@@ -6,13 +6,113 @@ use std::collections::{BTreeMap, BTreeSet};
 
 pub const CLI_PROXY_VERSION: &str = "7.2.135";
 pub const CLI_PROXY_COMMIT: &str = "856ddd8df746a38a6033dbbf6c140974bf5aea0f";
-pub const CLI_PROXY_PACKAGE_SHA256: &str =
+pub const CLI_PROXY_PACKAGE_SHA256_WINDOWS: &str =
     "80eef3e63e229405362c0f302abba50909cd53f10f6036c438d3f4f765144d34";
-pub const CLI_PROXY_SHA256: &str =
+/// Upstream `CLIProxyAPI_7.2.135_darwin_aarch64.tar.gz` archive hash, verified
+/// against upstream `checksums.txt` on 2026-09-09.
+pub const CLI_PROXY_PACKAGE_SHA256_MACOS: &str =
+    "c5f6e785cf7568c177d5c31aa75c389c4bb1b1dee9e0133887b9bce3200475dd";
+#[cfg(windows)]
+pub const CLI_PROXY_PACKAGE_SHA256: &str = CLI_PROXY_PACKAGE_SHA256_WINDOWS;
+#[cfg(not(windows))]
+pub const CLI_PROXY_PACKAGE_SHA256: &str = CLI_PROXY_PACKAGE_SHA256_MACOS;
+pub const CLI_PROXY_SHA256_WINDOWS: &str =
     "0a8ffc52dfb2a466baa1b006341b350bdb1f76fc70b6cc80375bb99afdff697b";
+/// `cli-proxy-api` Mach-O arm64 executable hash from the darwin_aarch64
+/// package above (single-file package, no plugin bundled).
+pub const CLI_PROXY_SHA256_MACOS: &str =
+    "5f24ebf3ed2caeee6ff63b5eaba7ccdb66f3ccb7af273ba1f70d68dc2f3531fb";
+#[cfg(windows)]
+pub const CLI_PROXY_SHA256: &str = CLI_PROXY_SHA256_WINDOWS;
+#[cfg(not(windows))]
+pub const CLI_PROXY_SHA256: &str = CLI_PROXY_SHA256_MACOS;
 pub const GEMINI_PLUGIN_VERSION: &str = "1.0.5";
 pub const GEMINI_PLUGIN_SHA256: &str =
     "c1d849f13270329bff9f4d8ab8ef7507eba57642402beb19c60e66ecc2e40cee";
+
+/// Cross-platform executable / layout helpers. Windows binaries carry `.exe`,
+/// macOS binaries have no suffix. Forward slashes are used for relative
+/// paths so `Path::join` stays correct on both platforms.
+pub fn executable_file_name(base: &str) -> String {
+    if cfg!(windows) {
+        format!("{base}.exe")
+    } else {
+        base.to_owned()
+    }
+}
+
+pub fn gui_executable_file_name() -> &'static str {
+    if cfg!(windows) {
+        "Codex-Router.exe"
+    } else {
+        "Codex-Router"
+    }
+}
+
+pub fn host_executable_file_name() -> &'static str {
+    if cfg!(windows) {
+        "codex-router-host.exe"
+    } else {
+        "codex-router-host"
+    }
+}
+
+pub fn cli_executable_file_name() -> &'static str {
+    if cfg!(windows) {
+        "cli-proxy-api.exe"
+    } else {
+        "cli-proxy-api"
+    }
+}
+
+/// Relative path of the Gemini CLI plugin inside the portable tree.
+/// The upstream darwin package ships no plugin, so this is `None` off Windows
+/// and callers must skip the plugin hash check there.
+pub fn gemini_plugin_relative_path() -> Option<&'static std::path::Path> {
+    #[cfg(windows)]
+    {
+        Some(std::path::Path::new(
+            "app/plugins/windows/amd64/gemini-cli-v1.0.5.dll",
+        ))
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
+/// Normalize a freshly built runtime config for the current platform before
+/// it is written or pushed to CLIProxyAPI. Windows keeps the locked Gemini
+/// plugin entry (enforced by `validate`); other platforms must not point the
+/// CLI at a plugin directory that does not exist in their package.
+pub fn apply_platform_runtime_policy(config: &mut CliProxyConfig) {
+    #[cfg(not(windows))]
+    {
+        config.plugins.enabled = false;
+        config.plugins.configs.clear();
+    }
+    #[cfg(windows)]
+    {
+        let _ = config;
+    }
+}
+
+/// Portable runtime files that must exist before the Router Host starts.
+/// macOS has no Gemini plugin and no `.exe` suffixes.
+pub fn required_runtime_relative_paths() -> &'static [&'static str] {
+    #[cfg(windows)]
+    {
+        &[
+            "app/codex-router-host.exe",
+            "app/cli-proxy-api.exe",
+            "app/plugins/windows/amd64/gemini-cli-v1.0.5.dll",
+        ]
+    }
+    #[cfg(not(windows))]
+    {
+        &["app/codex-router-host", "app/cli-proxy-api"]
+    }
+}
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RouteTarget {
@@ -486,6 +586,9 @@ pub fn validate(config: &CliProxyConfig) -> Result<()> {
             bail!("unsafe internal prefix leaked into CLI config: {prefix}");
         }
     }
+    // The Gemini CLI plugin ships Windows-only; macOS runs without it, so the
+    // plugin lock is only enforced on Windows.
+    #[cfg(windows)]
     if !config.plugins.enabled || !config.plugins.configs.contains_key("gemini-cli") {
         bail!("locked Gemini CLI plugin is required");
     }
@@ -647,5 +750,72 @@ plugins:
             ..Default::default()
         };
         assert!(validate(&config).is_err());
+    }
+
+    #[test]
+    fn platform_executable_names_match_current_target() {
+        #[cfg(windows)]
+        {
+            assert_eq!(
+                super::executable_file_name("cli-proxy-api"),
+                "cli-proxy-api.exe"
+            );
+            assert_eq!(super::gui_executable_file_name(), "Codex-Router.exe");
+            assert_eq!(super::host_executable_file_name(), "codex-router-host.exe");
+            assert_eq!(super::cli_executable_file_name(), "cli-proxy-api.exe");
+            assert_eq!(super::CLI_PROXY_SHA256, super::CLI_PROXY_SHA256_WINDOWS);
+            assert!(super::gemini_plugin_relative_path().is_some());
+            assert!(super::required_runtime_relative_paths()
+                .iter()
+                .any(|path| path.ends_with(".dll")));
+        }
+        #[cfg(not(windows))]
+        {
+            assert_eq!(
+                super::executable_file_name("cli-proxy-api"),
+                "cli-proxy-api"
+            );
+            assert_eq!(super::gui_executable_file_name(), "Codex-Router");
+            assert_eq!(super::host_executable_file_name(), "codex-router-host");
+            assert_eq!(super::cli_executable_file_name(), "cli-proxy-api");
+            assert_eq!(super::CLI_PROXY_SHA256, super::CLI_PROXY_SHA256_MACOS);
+            assert_eq!(
+                super::CLI_PROXY_PACKAGE_SHA256,
+                super::CLI_PROXY_PACKAGE_SHA256_MACOS
+            );
+            assert!(super::gemini_plugin_relative_path().is_none());
+            assert!(!super::required_runtime_relative_paths()
+                .iter()
+                .any(|path| path.ends_with(".dll") || path.ends_with(".exe")));
+        }
+        for hash in [super::CLI_PROXY_SHA256, super::CLI_PROXY_PACKAGE_SHA256] {
+            assert_eq!(hash.len(), 64);
+            assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
+        }
+    }
+
+    #[test]
+    fn plugin_free_config_validates_off_windows() {
+        let mut config = CliProxyConfig::default();
+        config.plugins.enabled = false;
+        config.plugins.configs.clear();
+        #[cfg(windows)]
+        assert!(validate(&config).is_err());
+        #[cfg(not(windows))]
+        assert!(validate(&config).is_ok());
+    }
+
+    #[test]
+    fn platform_runtime_policy_disables_plugins_off_windows() {
+        let mut config = CliProxyConfig::default();
+        super::apply_platform_runtime_policy(&mut config);
+        #[cfg(windows)]
+        assert!(config.plugins.enabled);
+        #[cfg(not(windows))]
+        {
+            assert!(!config.plugins.enabled);
+            assert!(config.plugins.configs.is_empty());
+            assert!(validate(&config).is_ok());
+        }
     }
 }

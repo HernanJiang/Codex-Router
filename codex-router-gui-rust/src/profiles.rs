@@ -2438,6 +2438,7 @@ experimental_bearer_token = "fixture-secret"
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    #[cfg(windows)]
     #[test]
     fn oauth_snapshot_is_dpapi_protected_and_restored_for_current_user() {
         let root = temporary_test_dir("dpapi");

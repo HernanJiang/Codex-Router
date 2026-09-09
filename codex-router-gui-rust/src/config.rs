@@ -580,8 +580,14 @@ impl Default for RouterConfig {
 
 impl RouterConfig {
     pub fn is_router_root(path: &std::path::Path) -> bool {
-        path.join("app").join("codex-router-host.exe").is_file()
-            && path.join("app").join("cli-proxy-api.exe").is_file()
+        use codex_router_lib::backend::config_compiler as cli_compiler;
+        path.join("app")
+            .join(cli_compiler::host_executable_file_name())
+            .is_file()
+            && path
+                .join("app")
+                .join(cli_compiler::cli_executable_file_name())
+                .is_file()
     }
 
     pub fn load(path: &std::path::Path) -> anyhow::Result<Self> {
